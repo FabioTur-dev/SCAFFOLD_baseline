@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-MULTI-GPU PARALLEL-CLIENT FEDERATED LEARNING (SCAFFOLD-Lite)
-
-Ogni GPU allena uno o più client in parallelo.
-Scala perfettamente su RunC.ai con 2-8 GPU.
-
-Include:
-  - CIFAR-10, CIFAR-100, SVHN
-  - α ∈ {0.5, 0.1, 0.05}
-  - 100 federated rounds
-  - ResNet18 pretrained + partial fine-tuning
-  - SCAFFOLD-Lite
-  - Real parallelism: ogni GPU = 1 client alla volta
+MULTI-GPU FEDERATED SCAFFOLD (SAFE VERSION)
+-------------------------------------------
+- 1 permanent worker per GPU (NO recreation → NO file descriptor leak)
+- Each worker processes client jobs sequentially
+- Global queue holds max = num_gpus jobs → extremely stable
+- Compatible with torchvision<=0.12 (uses pretrained=True)
 """
 
 import os
 import argparse
 import random
 import numpy as np
-from queue import Empty
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, Subset
 
-# ========================================================================
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+from queue import Empty
+
+# ============================================================
 # CONFIG
-# ========================================================================
+# ============================================================
+
 NUM_CLIENTS = 10
 DIRICHLET_ALPHAS = [0.5, 0.1, 0.05]
 NUM_ROUNDS = 100
@@ -37,15 +34,19 @@ LOCAL_EPOCHS = 2
 BATCH_SIZE = 64
 LR_INIT = 0.01
 LR_DECAY_ROUND = 50
+BETA = 0.01
 SEED = 42
-BETA = 0.01                 # SCAFFOLD-Lite stable
+
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
-# ========================================================================
-# UTILITY
-# ========================================================================
+# ============================================================
+# UTILS
+# ============================================================
+
 def set_seed(seed):
-    random.seed(seed); np.random.seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -60,8 +61,8 @@ def dirichlet_split(labels, n_clients, alpha):
         idx = np.where(labels == c)[0]
         np.random.shuffle(idx)
         p = np.random.dirichlet([alpha] * n_clients)
-        splits = (np.cumsum(p) * len(idx)).astype(int)
-        chunks = np.split(idx, splits[:-1])
+        cuts = (np.cumsum(p) * len(idx)).astype(int)
+        chunks = np.split(idx, cuts[:-1])
         for i in range(n_clients):
             per_client[i].extend(chunks[i])
 
@@ -71,20 +72,19 @@ def dirichlet_split(labels, n_clients, alpha):
     return per_client
 
 
-# ========================================================================
+# ============================================================
 # MODEL
-# ========================================================================
+# ============================================================
+
 class ResNet18_Pretrained(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        # Compatibilità con torchvision vecchie (0.9.1) e nuove
+        # torchvision 0.9 fallback
         try:
             from torchvision.models import ResNet18_Weights
             self.model = models.resnet18(
-                weights=ResNet18_Weights.IMAGENET1K_V1
-            )
+                weights=ResNet18_Weights.IMAGENET1K_V1)
         except Exception:
-            # fallback per torchvision<0.13 (come quella che hai su RunC.ai)
             self.model = models.resnet18(pretrained=True)
 
         in_f = self.model.fc.in_features
@@ -92,7 +92,6 @@ class ResNet18_Pretrained(nn.Module):
 
     def forward(self, x):
         return self.model(x)
-
 
 
 def freeze_except_deep(model):
@@ -123,26 +122,25 @@ def zero_like_trainable(model):
             if p.requires_grad]
 
 
-# ========================================================================
-# CLIENT UPDATE (SCAFFOLD-Lite)
-# ========================================================================
-def client_update(gpu_id, client_id, train_idx, trainset,
-                  global_params, c_local, c_global, lr,
-                  num_classes, result_queue):
-    """
-    Funzione eseguita su GPU worker.
-    """
+# ============================================================
+# CLIENT UPDATE
+# ============================================================
+
+def client_update(gpu_id, client_id, train_idx, trainset, global_params,
+                  c_local, c_global, lr, num_classes, result_queue):
+
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
 
-    # Build model
     model = ResNet18_Pretrained(num_classes).to(device)
     freeze_except_deep(model)
     set_trainable_params(model, global_params)
 
     loader = DataLoader(
         Subset(trainset, train_idx),
-        batch_size=BATCH_SIZE, shuffle=True)
+        batch_size=BATCH_SIZE,
+        shuffle=True
+    )
 
     old_params = get_trainable_params(model)
 
@@ -162,12 +160,11 @@ def client_update(gpu_id, client_id, train_idx, trainset,
             loss = nn.CrossEntropyLoss()(out, y)
             loss.backward()
 
-            i = 0
-            for p in model.parameters():
+            # SCAFFOLD correction
+            for i, p in enumerate(model.parameters()):
                 if p.requires_grad:
                     p.grad += (c_global[i].to(device) -
                                c_local[i].to(device))
-                    i += 1
 
             opt.step()
 
@@ -181,16 +178,39 @@ def client_update(gpu_id, client_id, train_idx, trainset,
         delta_c.append(dc)
         cl += dc
 
-    # Send result back to server
+    # Return result
     result_queue.put((client_id, new_params, c_local, delta_c))
 
 
-# ========================================================================
+# ============================================================
+# WORKER PROCESS (1 per GPU)
+# ============================================================
+
+def worker_loop(gpu_id, task_queue, result_queue, trainset, num_classes):
+
+    while True:
+        job = task_queue.get()
+
+        if job[0] == "STOP":
+            return
+
+        _, cid, train_idx, global_params, c_local, c_global, lr = job
+
+        client_update(
+            gpu_id, cid, train_idx, trainset,
+            global_params, c_local, c_global, lr,
+            num_classes, result_queue
+        )
+
+
+# ============================================================
 # EVALUATION
-# ========================================================================
+# ============================================================
+
 def evaluate(model, loader, device):
     model.eval()
-    correct = 0; total = 0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -200,18 +220,17 @@ def evaluate(model, loader, device):
     return correct / total
 
 
-# ========================================================================
+# ============================================================
 # FEDERATED SERVER LOOP
-# ========================================================================
+# ============================================================
+
 def run_federated(dataset_name, gpus):
 
-    print("\n=====================================")
-    print(f"DATASET = {dataset_name}")
-    print("=====================================\n")
+    print(f"\n========== DATASET: {dataset_name} ==========\n")
 
-    # ----------------------------
-    # Load dataset
-    # ----------------------------
+    # ------------------------------------
+    # LOAD DATASET
+    # ------------------------------------
     if dataset_name == "CIFAR10":
         num_classes = 10
         transform_train = transforms.Compose([
@@ -219,20 +238,15 @@ def run_federated(dataset_name, gpus):
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(224, padding=16),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
-            transforms.RandomErasing(p=0.25),
         ])
         transform_test = transforms.Compose([
             transforms.Resize(224),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
         ])
         trainset = datasets.CIFAR10("./data", train=True, download=True,
                                     transform=transform_train)
-        testset  = datasets.CIFAR10("./data", train=False, download=True,
-                                    transform=transform_test)
+        testset = datasets.CIFAR10("./data", train=False, download=True,
+                                   transform=transform_test)
         labels = trainset.targets
 
     elif dataset_name == "CIFAR100":
@@ -242,178 +256,153 @@ def run_federated(dataset_name, gpus):
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(224, padding=16),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
-            transforms.RandomErasing(p=0.25),
         ])
         transform_test = transforms.Compose([
             transforms.Resize(224),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
         ])
         trainset = datasets.CIFAR100("./data", train=True, download=True,
                                      transform=transform_train)
-        testset  = datasets.CIFAR100("./data", train=False, download=True,
-                                     transform=transform_test)
+        testset = datasets.CIFAR100("./data", train=False, download=True,
+                                    transform=transform_test)
         labels = trainset.targets
 
     elif dataset_name == "SVHN":
         num_classes = 10
         transform_train = transforms.Compose([
             transforms.Resize(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(224, padding=16),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
-            transforms.RandomErasing(p=0.25),
         ])
         transform_test = transforms.Compose([
             transforms.Resize(224),
             transforms.ToTensor(),
-            transforms.Normalize((0.485,0.456,0.406),
-                                 (0.229,0.224,0.225)),
         ])
-        trainset = datasets.SVHN("./data", split='train', download=True,
+        trainset = datasets.SVHN("./data", split="train", download=True,
                                  transform=transform_train)
-        testset  = datasets.SVHN("./data", split='test', download=True,
-                                 transform=transform_test)
+        testset = datasets.SVHN("./data", split="test", download=True,
+                                transform=transform_test)
         labels = trainset.labels
 
     testloader = DataLoader(testset, batch_size=256, shuffle=False)
 
-    # =================================================================
-    # LOOP SU α
-    # =================================================================
+    # ====================================================
+    # LOOP ON ALPHAS
+    # ====================================================
+
     for alpha in DIRICHLET_ALPHAS:
 
-        print(f"\n=== DATASET {dataset_name} | α={alpha} ===")
+        print(f"\n==== α = {alpha} ====\n")
 
         splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
-        # global model
         device0 = "cuda:0"
         global_model = ResNet18_Pretrained(num_classes).to(device0)
         freeze_except_deep(global_model)
         global_params = get_trainable_params(global_model)
 
         c_global = zero_like_trainable(global_model)
-        c_local = [zero_like_trainable(global_model) for _ in range(NUM_CLIENTS)]
+        c_local = [zero_like_trainable(global_model)
+                   for _ in range(NUM_CLIENTS)]
 
-        # multiprocessing queues
+        # ------------------------------------------------
+        # CREATE PERMANENT WORKERS (1 per GPU)
+        # ------------------------------------------------
+
         ctx = mp.get_context("spawn")
-        task_queue = ctx.Queue()
-        result_queue = ctx.Queue()
+        task_queue = ctx.Queue(maxsize=gpus)      # max gpus jobs
+        result_queue = ctx.Queue(maxsize=gpus)    # max gpus results
 
-        # spawn worker processes
         workers = []
         for gpu_id in range(gpus):
             p = ctx.Process(
                 target=worker_loop,
-                args=(gpu_id, task_queue, result_queue, trainset,
-                      num_classes))
+                args=(gpu_id, task_queue, result_queue,
+                      trainset, num_classes)
+            )
             p.start()
             workers.append(p)
 
-        # ------------------------------
+        # ====================================================
         # FEDERATED ROUNDS
-        # ------------------------------
+        # ====================================================
+
         for rnd in range(1, NUM_ROUNDS + 1):
+
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
             print(f"\n--- ROUND {rnd}/{NUM_ROUNDS} ---")
 
-            # assign clients to task queue
-            for cid in range(NUM_CLIENTS):
-                task_queue.put(
-                    ("run_client",
-                     cid,
-                     splits[cid],
-                     global_params,
-                     c_local[cid],
-                     c_global,
-                     lr)
-                )
+            # Submit all clients sequentially, 7 at a time
+            next_client = 0
+            finished = 0
 
-            # collect all results
-            results_received = 0
-            new_params_all = [None]*NUM_CLIENTS
-            delta_c_sum = zero_like_trainable(global_model)
+            while finished < NUM_CLIENTS:
 
-            while results_received < NUM_CLIENTS:
+                # dispatch jobs (one per GPU)
+                while next_client < NUM_CLIENTS and not task_queue.full():
+                    cid = next_client
+                    next_client += 1
+
+                    task_queue.put((
+                        "RUN",
+                        cid,
+                        splits[cid],
+                        global_params,
+                        c_local[cid],
+                        c_global,
+                        lr
+                    ))
+
+                # receive completed jobs
                 try:
                     cid, new_params, new_c_local, delta_c = \
                         result_queue.get(timeout=9999)
                 except Empty:
                     continue
 
-                new_params_all[cid] = new_params
                 c_local[cid] = new_c_local
-                for i, dc in enumerate(delta_c):
-                    delta_c_sum[i] += dc
+                if finished == 0:
+                    accum_params = [
+                        torch.zeros_like(new_params[i])
+                        for i in range(len(new_params))
+                    ]
 
-                results_received += 1
+                for i in range(len(accum_params)):
+                    accum_params[i] += new_params[i]
 
-            # aggregate average
-            avg_params = []
-            for i in range(len(global_params)):
-                avg_params.append(torch.stack(
-                    [p[i] for p in new_params_all]
-                ).mean(dim=0))
+                finished += 1
 
-            global_params = avg_params
+            # average
+            global_params = [p / NUM_CLIENTS for p in accum_params]
             set_trainable_params(global_model, global_params)
 
-            # update c_global
-            for i in range(len(c_global)):
-                c_global[i] += delta_c_sum[i] / NUM_CLIENTS
-
-            # evaluate
+            # evaluation
             acc = evaluate(global_model, testloader, device0)
             print(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-        # stop workers
-        for _ in range(len(workers)):
-            task_queue.put(("stop",))
+        # STOP WORKERS
+        for _ in range(gpus):
+            task_queue.put(("STOP",))
         for p in workers:
             p.join()
 
-        print(f"\n✔ FINISHED dataset={dataset_name}, alpha={alpha}\n")
+        print(f"\n✓ DONE dataset={dataset_name}, α={alpha}\n")
 
 
-# ========================================================================
-# WORKER LOOP (ESEGUITO SU OGNI GPU)
-# ========================================================================
-def worker_loop(gpu_id, task_queue, result_queue, trainset, num_classes):
-    while True:
-        msg = task_queue.get()
-        if msg[0] == "stop":
-            return
-
-        _, cid, train_idx, global_params, c_local, c_global, lr = msg
-
-        client_update(
-            gpu_id, cid, train_idx, trainset,
-            global_params, c_local, c_global, lr,
-            num_classes,
-            result_queue
-        )
-
-
-# ========================================================================
+# ============================================================
 # MAIN
-# ========================================================================
+# ============================================================
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1)
     args = parser.parse_args()
 
-    gpus = args.gpus
     set_seed(SEED)
 
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
-        run_federated(ds, gpus=gpus)
+        run_federated(ds, gpus=args.gpus)
 
 
 if __name__ == "__main__":
     main()
+
