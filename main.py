@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-MULTI-GPU FEDERATED SCAFFOLD (SAFE VERSION)
+MULTI-GPU FEDERATED SCAFFOLD — SAFE VERSION
 -------------------------------------------
-- 1 permanent worker per GPU (NO recreation → NO file descriptor leak)
-- Each worker processes client jobs sequentially
-- Global queue holds max = num_gpus jobs → extremely stable
-- Compatible with torchvision<=0.12 (uses pretrained=True)
+- Soluzione A: ResNet18 completamente addestrabile (NO FREEZE)
+- 1 worker permanente per GPU (nessun leak di file descriptors)
+- Ogni worker allena 1 client alla volta (stabile)
+- Compatibile con torchvision vecchio (pretrained=True)
+- Niente mismatch tra tensor dims
 """
 
 import os
@@ -87,21 +88,16 @@ class ResNet18_Pretrained(nn.Module):
         except Exception:
             self.model = models.resnet18(pretrained=True)
 
+        # override last layer
         in_f = self.model.fc.in_features
         self.model.fc = nn.Linear(in_f, num_classes)
 
+        # SOLUZIONE A: ALL parameters trainable
+        for p in self.model.parameters():
+            p.requires_grad = True
+
     def forward(self, x):
         return self.model(x)
-
-
-def freeze_except_deep(model):
-    for name, p in model.model.named_parameters():
-        if (name.startswith("layer3") or
-            name.startswith("layer4") or
-            name.startswith("fc")):
-            p.requires_grad = True
-        else:
-            p.requires_grad = False
 
 
 def get_trainable_params(model):
@@ -132,9 +128,13 @@ def client_update(gpu_id, client_id, train_idx, trainset, global_params,
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
 
+    # Build model
     model = ResNet18_Pretrained(num_classes).to(device)
-    freeze_except_deep(model)
-    set_trainable_params(model, global_params)
+
+    # Load global params
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    for p, new in zip(trainable, global_params):
+        p.data = new.clone().to(device)
 
     loader = DataLoader(
         Subset(trainset, train_idx),
@@ -142,13 +142,9 @@ def client_update(gpu_id, client_id, train_idx, trainset, global_params,
         shuffle=True
     )
 
-    old_params = get_trainable_params(model)
+    old_params = [p.detach().clone().cpu() for p in trainable]
 
-    opt = optim.SGD(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, momentum=0.9, weight_decay=5e-4
-    )
-
+    opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
     E = len(loader)
 
     # TRAIN
@@ -161,29 +157,28 @@ def client_update(gpu_id, client_id, train_idx, trainset, global_params,
             loss.backward()
 
             # SCAFFOLD correction
-            for i, p in enumerate(model.parameters()):
-                if p.requires_grad:
-                    p.grad += (c_global[i].to(device) -
-                               c_local[i].to(device))
+            for i, p in enumerate(trainable):
+                p.grad += (c_global[i].to(device) -
+                           c_local[i].to(device))
 
             opt.step()
 
-    new_params = get_trainable_params(model)
+    # NEW PARAMS
+    new_params = [p.detach().cpu().clone() for p in trainable]
 
-    # Update c_local
+    # UPDATE c_local
     delta_c = []
-    for new, old, cl, cg in zip(new_params, old_params, c_local, c_global):
-        diff = new - old
+    for i in range(len(new_params)):
+        diff = new_params[i] - old_params[i]
         dc = BETA * (diff / max(E, 1))
         delta_c.append(dc)
-        cl += dc
+        c_local[i] += dc
 
-    # Return result
     result_queue.put((client_id, new_params, c_local, delta_c))
 
 
 # ============================================================
-# WORKER PROCESS (1 per GPU)
+# WORKER (1 per GPU)
 # ============================================================
 
 def worker_loop(gpu_id, task_queue, result_queue, trainset, num_classes):
@@ -198,8 +193,9 @@ def worker_loop(gpu_id, task_queue, result_queue, trainset, num_classes):
 
         client_update(
             gpu_id, cid, train_idx, trainset,
-            global_params, c_local, c_global, lr,
-            num_classes, result_queue
+            global_params, c_local, c_global,
+            lr, num_classes,
+            result_queue
         )
 
 
@@ -221,7 +217,7 @@ def evaluate(model, loader, device):
 
 
 # ============================================================
-# FEDERATED SERVER LOOP
+# FEDERATED SERVER
 # ============================================================
 
 def run_federated(dataset_name, gpus):
@@ -264,7 +260,7 @@ def run_federated(dataset_name, gpus):
         trainset = datasets.CIFAR100("./data", train=True, download=True,
                                      transform=transform_train)
         testset = datasets.CIFAR100("./data", train=False, download=True,
-                                    transform=transform_test)
+                                   transform=transform_test)
         labels = trainset.targets
 
     elif dataset_name == "SVHN":
@@ -297,20 +293,17 @@ def run_federated(dataset_name, gpus):
 
         device0 = "cuda:0"
         global_model = ResNet18_Pretrained(num_classes).to(device0)
-        freeze_except_deep(global_model)
         global_params = get_trainable_params(global_model)
-
         c_global = zero_like_trainable(global_model)
-        c_local = [zero_like_trainable(global_model)
-                   for _ in range(NUM_CLIENTS)]
+        c_local = [zero_like_trainable(global_model) for _ in range(NUM_CLIENTS)]
 
         # ------------------------------------------------
-        # CREATE PERMANENT WORKERS (1 per GPU)
+        # WORKERS (PERMANENT)
         # ------------------------------------------------
 
         ctx = mp.get_context("spawn")
-        task_queue = ctx.Queue(maxsize=gpus)      # max gpus jobs
-        result_queue = ctx.Queue(maxsize=gpus)    # max gpus results
+        task_queue = ctx.Queue(maxsize=gpus)
+        result_queue = ctx.Queue(maxsize=gpus)
 
         workers = []
         for gpu_id in range(gpus):
@@ -322,22 +315,22 @@ def run_federated(dataset_name, gpus):
             p.start()
             workers.append(p)
 
-        # ====================================================
+        # ------------------------------------------------
         # FEDERATED ROUNDS
-        # ====================================================
+        # ------------------------------------------------
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
             print(f"\n--- ROUND {rnd}/{NUM_ROUNDS} ---")
 
-            # Submit all clients sequentially, 7 at a time
             next_client = 0
             finished = 0
 
+            # Multi-GPU streaming
             while finished < NUM_CLIENTS:
 
-                # dispatch jobs (one per GPU)
+                # dispatch until GPUs full
                 while next_client < NUM_CLIENTS and not task_queue.full():
                     cid = next_client
                     next_client += 1
@@ -352,34 +345,27 @@ def run_federated(dataset_name, gpus):
                         lr
                     ))
 
-                # receive completed jobs
-                try:
-                    cid, new_params, new_c_local, delta_c = \
-                        result_queue.get(timeout=9999)
-                except Empty:
-                    continue
-
+                # receive one result
+                cid, new_params, new_c_local, delta_c = result_queue.get()
                 c_local[cid] = new_c_local
-                if finished == 0:
-                    accum_params = [
-                        torch.zeros_like(new_params[i])
-                        for i in range(len(new_params))
-                    ]
 
-                for i in range(len(accum_params)):
-                    accum_params[i] += new_params[i]
+                if finished == 0:
+                    accum = [torch.zeros_like(new_params[i])
+                             for i in range(len(new_params))]
+
+                for i in range(len(accum)):
+                    accum[i] += new_params[i]
 
                 finished += 1
 
-            # average
-            global_params = [p / NUM_CLIENTS for p in accum_params]
+            global_params = [p / NUM_CLIENTS for p in accum]
             set_trainable_params(global_model, global_params)
 
-            # evaluation
+            # Evaluate
             acc = evaluate(global_model, testloader, device0)
             print(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-        # STOP WORKERS
+        # Stop workers
         for _ in range(gpus):
             task_queue.put(("STOP",))
         for p in workers:
