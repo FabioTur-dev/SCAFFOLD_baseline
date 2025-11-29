@@ -155,12 +155,20 @@ def dirichlet_split(labels, n_clients, alpha):
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
-        from torchvision.models import ResNet18_Weights
-        self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
 
-        inf = self.m.fc.in_features
-        self.m.fc = nn.Linear(inf, nc)
+        # Try new torchvision API
+        try:
+            from torchvision.models import ResNet18_Weights
+            self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        except Exception:
+            # Fall back to old API
+            self.m = models.resnet18(pretrained=True)
 
+        # Replace FC
+        in_f = self.m.fc.in_features
+        self.m.fc = nn.Linear(in_f, nc)
+
+        # Freeze all except last blocks (SCAFFOLD-Lite++)
         for name, p in self.m.named_parameters():
             if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -169,6 +177,7 @@ class ResNet18Pre(nn.Module):
 
     def forward(self, x):
         return self.m(x)
+
 
 
 # ======================================================================
