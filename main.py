@@ -40,7 +40,7 @@ def loga(msg):
     print(msg, flush=True)
 
 def logd(msg):
-    pass    # disable worker/server debug
+    pass    # debug disabilitato
 
 # ==============================================================
 # SEED
@@ -145,19 +145,17 @@ class ResNet18Pre(nn.Module):
 
 def preprocess_raw_dataset(ds_name):
     os.makedirs("cached", exist_ok=True)
-    data_file = "cached/train_raw.pt"
-    label_file = "cached/train_labels.pt"
+    data_file = f"cached/{ds_name}_train_raw.pt"
+    label_file = f"cached/{ds_name}_train_labels.pt"
 
-    # Already done?
     if os.path.exists(data_file) and os.path.exists(label_file):
         data = torch.load(data_file)
         labels = torch.load(label_file)
         return data, labels
 
-    # Load torch dataset (only once)
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)  # uint8 N×3×32×32
+        data = torch.tensor(d.data).permute(0,3,1,2)  # N×3×32×32 uint8
         labels = torch.tensor(d.targets)
     elif ds_name == "CIFAR100":
         d = datasets.CIFAR100("./data", train=True, download=True)
@@ -166,8 +164,7 @@ def preprocess_raw_dataset(ds_name):
     else:
         from torchvision.datasets import SVHN
         d = SVHN("./data", split="train", download=True)
-        data = torch.tensor(d.data)  # (N, H, W, C)
-        data = data.permute(0,3,1,2)
+        data = torch.tensor(d.data).permute(0,3,1,2)
         labels = torch.tensor(d.labels)
 
     torch.save(data, data_file)
@@ -182,13 +179,10 @@ def preprocess_raw_dataset(ds_name):
 def client_update_worker(args):
     device = f"cuda:{args.gpu}"
 
-    # Load raw data
-    data = torch.load("cached/train_raw.pt")
-    labels = torch.load("cached/train_labels.pt")
-
+    data = torch.load("cached/" + args.dataset + "_train_raw.pt")
+    labels = torch.load("cached/" + args.dataset + "_train_labels.pt")
     indices = torch.load(args.train_idx)
 
-    # dataset con augmentations come il tuo script che funziona
     ds = RawDataset(data, labels, indices, augment=True)
 
     loader = DataLoader(
@@ -227,7 +221,6 @@ def client_update_worker(args):
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
 
-    # Save update
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
 
@@ -267,10 +260,10 @@ def evaluate(model, loader, device):
 
 def federated_run(ds_name, gpus):
 
-    # Preprocess raw data once
+    # raw data cached una sola volta
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
-    # Test loader
+    # Test loader con norm corretta
     transform_test = transforms.Compose([
         transforms.Resize(224),
         transforms.ToTensor(),
@@ -291,16 +284,23 @@ def federated_run(ds_name, gpus):
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
 
+    labels_np = raw_labels.numpy()
+
     for alpha in DIR_ALPHAS:
 
-        labels_np = raw_labels.numpy()
+        loga(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
+
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
 
-        global_model = ResNet18Pre(nc).to("cuda:0")
+        device0 = "cuda:0"
+        global_model = ResNet18Pre(nc).to(device0)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
         os.makedirs("global_ckpt", exist_ok=True)
-        torch.save(global_model.state_dict(), "global_ckpt/global_round_0.pth")
+        os.makedirs("client_updates", exist_ok=True)
+
+        global_ckpt_path = "global_ckpt/global_round_0.pth"
+        torch.save(global_model.state_dict(), global_ckpt_path)
 
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
         c_local = [[torch.zeros_like(p).cpu() for p in trainable]
@@ -309,21 +309,23 @@ def federated_run(ds_name, gpus):
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
-            loga(f"[ROUND {rnd}] LR={lr}")
 
-            # save control variates
+            # Save control variates
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
+            # Save indices
             idx_paths = []
             for cid in range(NUM_CLIENTS):
                 path = f"global_ckpt/train_idx_{cid}.pth"
                 torch.save(splits[cid], path)
                 idx_paths.append(path)
 
-            global_path = f"global_ckpt/global_round_{rnd-1}.pth"
-            torch.save(global_model.state_dict(), global_path)
+            # Save global model
+            global_ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
+            torch.save(global_model.state_dict(), global_ckpt_path)
 
+            # Launch workers (silenziosi)
             procs = []
             out_paths = []
 
@@ -339,14 +341,18 @@ def federated_run(ds_name, gpus):
                     "--num_classes", str(nc),
                     "--cid", str(cid),
                     "--gpu", str(gpu),
-                    "--global_ckpt", global_path,
+                    "--global_ckpt", global_ckpt_path,
                     "--state_c", state_c_path,
                     "--train_idx", idx_paths[cid],
                     "--lr", str(lr),
                     "--output", outp
                 ]
 
-                procs.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                procs.append(subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                ))
 
             for p in procs:
                 p.wait()
@@ -364,12 +370,12 @@ def federated_run(ds_name, gpus):
 
             avg_params = [p / NUM_CLIENTS for p in new_accum]
 
-            idx = 0
+            idx_param = 0
             with torch.no_grad():
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[idx].to("cuda:0"))
-                        idx += 1
+                        p.copy_(avg_params[idx_param].to(device0))
+                        idx_param += 1
 
             # Update control variates
             for i in range(len(c_global)):
@@ -379,7 +385,7 @@ def federated_run(ds_name, gpus):
                 c_local[u["cid"]] = u["new_c_local"]
 
             # Eval
-            acc = evaluate(global_model, testloader, "cuda:0")
+            acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
 # ==============================================================
@@ -390,7 +396,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--dataset", type=str)
-    parser.add.add_argument("--num_classes", type=int)
+    parser.add_argument("--num_classes", type=int)
     parser.add_argument("--cid", type=int)
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--global_ckpt", type=str)
@@ -398,14 +404,18 @@ def main():
     parser.add_argument("--train_idx", type=str)
     parser.add_argument("--output", type=str)
     parser.add_argument("--lr", type=float)
+    parser.add_argument("--gpus", type=int, default=1)
+
     args = parser.parse_args()
 
     if args.worker:
         return client_update_worker(args)
 
     set_seed(SEED)
+
+    # se vuoi solo CIFAR10, lascia così; altrimenti aggiungi CIFAR100, SVHN
     for ds in ["CIFAR10"]:
-        federated_run(ds, 7)
+        federated_run(ds, args.gpus)
 
 if __name__ == "__main__":
     main()
