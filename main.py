@@ -22,7 +22,7 @@ from torchvision import datasets, transforms, models
 
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5]
-NUM_ROUNDS = 100
+NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
 
