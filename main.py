@@ -7,6 +7,7 @@ import subprocess
 import sys
 import random
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -33,17 +34,13 @@ GRAD_CLIP = 5.0
 SEED = 42
 
 # ==============================================================
-# LOGGING — only accuracy per round
-# ==============================================================
 
 def loga(msg):
     print(msg, flush=True)
 
 def logd(msg):
-    pass    # debug disabilitato
+    pass
 
-# ==============================================================
-# SEED
 # ==============================================================
 
 def set_seed(s):
@@ -53,8 +50,6 @@ def set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
-# ==============================================================
-# RAW DATASET WRAPPER (dynamic augmentation)
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -86,12 +81,10 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]           # raw uint8 CHW
+        img = self.data[idx]
         img = self.T(img)
         return img, self.labels[idx]
 
-# ==============================================================
-# DIRICHLET SPLIT
 # ==============================================================
 
 def dirichlet_split(labels, n_clients, alpha):
@@ -114,8 +107,6 @@ def dirichlet_split(labels, n_clients, alpha):
     return per
 
 # ==============================================================
-# MODEL (freeze for SCAFFOLD-Lite)
-# ==============================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
@@ -129,7 +120,6 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # Freeze except last blocks
         for name, p in self.m.named_parameters():
             if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -139,8 +129,6 @@ class ResNet18Pre(nn.Module):
     def forward(self, x):
         return self.m(x)
 
-# ==============================================================
-# PREPROCESS RAW DATASET ONCE
 # ==============================================================
 
 def preprocess_raw_dataset(ds_name):
@@ -155,7 +143,7 @@ def preprocess_raw_dataset(ds_name):
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)  # N×3×32×32 uint8
+        data = torch.tensor(d.data).permute(0,3,1,2)
         labels = torch.tensor(d.targets)
     elif ds_name == "CIFAR100":
         d = datasets.CIFAR100("./data", train=True, download=True)
@@ -173,8 +161,6 @@ def preprocess_raw_dataset(ds_name):
     return data, labels
 
 # ==============================================================
-# WORKER — SCAFFOLD-Lite + Dynamic Augmentation
-# ==============================================================
 
 def client_update_worker(args):
     device = f"cuda:{args.gpu}"
@@ -185,16 +171,13 @@ def client_update_worker(args):
 
     ds = RawDataset(data, labels, indices, augment=True)
 
-    loader = DataLoader(
-        ds, batch_size=BATCH, shuffle=True,
-        num_workers=2, pin_memory=True
-    )
+    loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
+                        num_workers=2, pin_memory=True)
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    trainable = list(trainable)   # <<< PATCH HPC-SAFE
 
     c_state = torch.load(args.state_c, map_location="cpu")
     c_global = c_state["c_global"]
@@ -215,7 +198,6 @@ def client_update_worker(args):
             loss = loss_fn(out, yb)
             loss.backward()
 
-            # Scaffold-Lite grad correction
             for i, p in enumerate(trainable):
                 p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
@@ -241,8 +223,6 @@ def client_update_worker(args):
     return
 
 # ==============================================================
-# EVALUATION
-# ==============================================================
 
 def evaluate(model, loader, device):
     model.eval()
@@ -256,15 +236,11 @@ def evaluate(model, loader, device):
     return correct / total
 
 # ==============================================================
-# FEDERATED LOOP
-# ==============================================================
 
 def federated_run(ds_name, gpus):
 
-    # raw data cached una sola volta
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
-    # Test loader
     transform_test = transforms.Compose([
         transforms.Resize(224),
         transforms.ToTensor(),
@@ -296,7 +272,6 @@ def federated_run(ds_name, gpus):
         device0 = "cuda:0"
         global_model = ResNet18Pre(nc).to(device0)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
-        trainable = list(trainable)   # <<< PATCH HPC-SAFE
 
         os.makedirs("global_ckpt", exist_ok=True)
         os.makedirs("client_updates", exist_ok=True)
@@ -312,22 +287,18 @@ def federated_run(ds_name, gpus):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
 
-            # Save control variates
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # Save indices
             idx_paths = []
             for cid in range(NUM_CLIENTS):
                 path = f"global_ckpt/train_idx_{cid}.pth"
                 torch.save(splits[cid], path)
                 idx_paths.append(path)
 
-            # Save global model
             global_ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
             torch.save(global_model.state_dict(), global_ckpt_path)
 
-            # Launch workers (silenziosi)
             procs = []
             out_paths = []
 
@@ -350,16 +321,27 @@ def federated_run(ds_name, gpus):
                     "--output", outp
                 ]
 
-                procs.append(subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                ))
+                # ✔️ WORKER NON SILENZIATO
+                p = subprocess.Popen(cmd)
+                procs.append(p)
 
+            # attendo tutti
             for p in procs:
                 p.wait()
 
-            # Aggregate
+            # ✔️ ATTENDO 80ms PER EVITARE RACE SU FS
+            time.sleep(0.08)
+
+            # ✔️ CONTROLLO CHE TUTTI I FILE ESISTANO
+            missing = [f for f in out_paths if not os.path.exists(f)]
+            if len(missing) > 0:
+                print("\n\n❌ ERRORE FATALE: uno o più worker non hanno prodotto output!\n")
+                print("File mancanti:")
+                for m in missing:
+                    print(" -", m)
+                print("\nPossibili cause: OOM, crash DataLoader, errore codice nel worker.")
+                sys.exit(1)
+
             updates = [torch.load(out_paths[c], map_location="cpu")
                        for c in range(NUM_CLIENTS)]
 
@@ -379,20 +361,15 @@ def federated_run(ds_name, gpus):
                         p.copy_(avg_params[idx_param].to(device0))
                         idx_param += 1
 
-            # Update control variates
             for i in range(len(c_global)):
                 c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
             for u in updates:
                 c_local[u["cid"]] = u["new_c_local"]
 
-            # Eval
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-
-# ==============================================================
-# MAIN
 # ==============================================================
 
 def main():
@@ -418,7 +395,6 @@ def main():
 
     for ds in ["CIFAR10"]:
         federated_run(ds, args.gpus)
-
 
 if __name__ == "__main__":
     main()
