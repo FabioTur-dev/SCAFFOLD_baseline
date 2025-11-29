@@ -7,20 +7,21 @@ import subprocess
 import sys
 import random
 import numpy as np
-import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
 
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
+from torchvision.transforms.functional import to_pil_image
 
 # ==============================================================
 # CONFIG (SCAFFOLD-Lite Stable)
 # ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5, 0.1, 0.05]
+DIR_ALPHAS = [0.5]   # puoi aggiungere 0.1,0.05
 NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
@@ -34,13 +35,17 @@ GRAD_CLIP = 5.0
 SEED = 42
 
 # ==============================================================
+# LOGGING — only accuracy per round
+# ==============================================================
 
 def loga(msg):
     print(msg, flush=True)
 
 def logd(msg):
-    pass
+    pass    # debug off
 
+# ==============================================================
+# SEED
 # ==============================================================
 
 def set_seed(s):
@@ -50,6 +55,8 @@ def set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+# ==============================================================
+# RAW DATASET WRAPPER (dynamic augmentation)
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -66,7 +73,7 @@ class RawDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
-                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2))
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
@@ -81,10 +88,11 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]
-        img = self.T(img)
-        return img, self.labels[idx]
+        img = to_pil_image(self.data[idx])   # <<< fondamentale per CIFAR
+        return self.T(img), self.labels[idx]
 
+# ==============================================================
+# DIRICHLET SPLIT
 # ==============================================================
 
 def dirichlet_split(labels, n_clients, alpha):
@@ -107,6 +115,8 @@ def dirichlet_split(labels, n_clients, alpha):
     return per
 
 # ==============================================================
+# MODEL
+# ==============================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
@@ -120,6 +130,7 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # freeze everything except last third
         for name, p in self.m.named_parameters():
             if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -130,6 +141,8 @@ class ResNet18Pre(nn.Module):
         return self.m(x)
 
 # ==============================================================
+# PREPROCESS RAW DATASET ONCE
+# ==============================================================
 
 def preprocess_raw_dataset(ds_name):
     os.makedirs("cached", exist_ok=True)
@@ -137,9 +150,7 @@ def preprocess_raw_dataset(ds_name):
     label_file = f"cached/{ds_name}_train_labels.pt"
 
     if os.path.exists(data_file) and os.path.exists(label_file):
-        data = torch.load(data_file)
-        labels = torch.load(label_file)
-        return data, labels
+        return torch.load(data_file), torch.load(label_file)
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
@@ -157,20 +168,20 @@ def preprocess_raw_dataset(ds_name):
 
     torch.save(data, data_file)
     torch.save(labels, label_file)
-
     return data, labels
 
+# ==============================================================
+# WORKER — SCAFFOLD-Lite + Dynamic Augmentation
 # ==============================================================
 
 def client_update_worker(args):
     device = f"cuda:{args.gpu}"
 
-    data = torch.load("cached/" + args.dataset + "_train_raw.pt")
-    labels = torch.load("cached/" + args.dataset + "_train_labels.pt")
+    data = torch.load(f"cached/{args.dataset}_train_raw.pt")
+    labels = torch.load(f"cached/{args.dataset}_train_labels.pt")
     indices = torch.load(args.train_idx)
 
     ds = RawDataset(data, labels, indices, augment=True)
-
     loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
                         num_workers=2, pin_memory=True)
 
@@ -192,7 +203,6 @@ def client_update_worker(args):
     for _ in range(LOCAL_EPOCHS):
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-
             opt.zero_grad()
             out = model(xb)
             loss = loss_fn(out, yb)
@@ -205,8 +215,8 @@ def client_update_worker(args):
             opt.step()
 
     new_params = [p.detach().clone().cpu() for p in trainable]
-    delta_c = []
 
+    delta_c = []
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
         dc = BETA * (diff / max(E, 1))
@@ -223,6 +233,8 @@ def client_update_worker(args):
     return
 
 # ==============================================================
+# EVALUATION
+# ==============================================================
 
 def evaluate(model, loader, device):
     model.eval()
@@ -236,11 +248,15 @@ def evaluate(model, loader, device):
     return correct / total
 
 # ==============================================================
+# FEDERATED LOOP (HPC-SAFE)
+# ==============================================================
 
 def federated_run(ds_name, gpus):
 
+    # load cached raw data
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
+    # test loader
     transform_test = transforms.Compose([
         transforms.Resize(224),
         transforms.ToTensor(),
@@ -260,13 +276,11 @@ def federated_run(ds_name, gpus):
         nc = 10
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
-
     labels_np = raw_labels.numpy()
 
     for alpha in DIR_ALPHAS:
 
         loga(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
-
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
 
         device0 = "cuda:0"
@@ -283,22 +297,32 @@ def federated_run(ds_name, gpus):
         c_local = [[torch.zeros_like(p).cpu() for p in trainable]
                    for _ in range(NUM_CLIENTS)]
 
+        # ==========================================================
+        # ROUNDS
+        # ==========================================================
+
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
 
+            # Save control variates
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
+            # Save train indexes
             idx_paths = []
             for cid in range(NUM_CLIENTS):
                 path = f"global_ckpt/train_idx_{cid}.pth"
                 torch.save(splits[cid], path)
                 idx_paths.append(path)
 
+            # Save global model
             global_ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
             torch.save(global_model.state_dict(), global_ckpt_path)
 
+            # ---------------------------------------------
+            # Workers — silent mode
+            # ---------------------------------------------
             procs = []
             out_paths = []
 
@@ -321,30 +345,62 @@ def federated_run(ds_name, gpus):
                     "--output", outp
                 ]
 
-                # ✔️ WORKER NON SILENZIATO
-                p = subprocess.Popen(cmd)
-                procs.append(p)
+                procs.append(subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                ))
 
-            # attendo tutti
+            # wait all workers
             for p in procs:
                 p.wait()
 
-            # ✔️ ATTENDO 80ms PER EVITARE RACE SU FS
-            time.sleep(0.08)
+            # ---------------------------------------------
+            # HPC-SAFE FILE LOADING (retry logic)
+            # ---------------------------------------------
+            updates = []
 
-            # ✔️ CONTROLLO CHE TUTTI I FILE ESISTANO
-            missing = [f for f in out_paths if not os.path.exists(f)]
-            if len(missing) > 0:
-                print("\n\n❌ ERRORE FATALE: uno o più worker non hanno prodotto output!\n")
-                print("File mancanti:")
-                for m in missing:
-                    print(" -", m)
-                print("\nPossibili cause: OOM, crash DataLoader, errore codice nel worker.")
-                sys.exit(1)
+            for cid in range(NUM_CLIENTS):
+                outp = out_paths[cid]
 
-            updates = [torch.load(out_paths[c], map_location="cpu")
-                       for c in range(NUM_CLIENTS)]
+                # wait until file appears
+                wait_time = 0
+                while not os.path.exists(outp) and wait_time < 30:
+                    time.sleep(1)
+                    wait_time += 1
 
+                # relaunch worker once if still missing
+                if not os.path.exists(outp):
+                    cmd = [
+                        sys.executable, "main.py",
+                        "--worker",
+                        "--dataset", ds_name,
+                        "--num_classes", str(nc),
+                        "--cid", str(cid),
+                        "--gpu", str(cid % gpus),
+                        "--global_ckpt", global_ckpt_path,
+                        "--state_c", state_c_path,
+                        "--train_idx", idx_paths[cid],
+                        "--lr", str(lr),
+                        "--output", outp
+                    ]
+                    subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    ).wait()
+
+                    wait_time = 0
+                    while not os.path.exists(outp) and wait_time < 30:
+                        time.sleep(1)
+                        wait_time += 1
+
+                if not os.path.exists(outp):
+                    raise RuntimeError(f"Worker {cid} FAILED twice: {outp}")
+
+                updates.append(torch.load(outp, map_location="cpu"))
+
+            # ---------------------------------------------
+            # AGGREGATION
+            # ---------------------------------------------
             new_accum = None
             for u in updates:
                 if new_accum is None:
@@ -354,22 +410,26 @@ def federated_run(ds_name, gpus):
 
             avg_params = [p / NUM_CLIENTS for p in new_accum]
 
-            idx_param = 0
+            idx_p = 0
             with torch.no_grad():
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[idx_param].to(device0))
-                        idx_param += 1
+                        p.copy_(avg_params[idx_p].to(device0))
+                        idx_p += 1
 
+            # update variates
             for i in range(len(c_global)):
                 c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
             for u in updates:
                 c_local[u["cid"]] = u["new_c_local"]
 
+            # EVAL
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
+# ==============================================================
+# MAIN
 # ==============================================================
 
 def main():
@@ -398,7 +458,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
