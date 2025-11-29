@@ -77,13 +77,22 @@ def dirichlet_split(labels, n_clients, alpha):
 class ResNet18_Pretrained(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        self.model = models.resnet18(
-            weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # Compatibilità con torchvision vecchie (0.9.1) e nuove
+        try:
+            from torchvision.models import ResNet18_Weights
+            self.model = models.resnet18(
+                weights=ResNet18_Weights.IMAGENET1K_V1
+            )
+        except Exception:
+            # fallback per torchvision<0.13 (come quella che hai su RunC.ai)
+            self.model = models.resnet18(pretrained=True)
+
         in_f = self.model.fc.in_features
         self.model.fc = nn.Linear(in_f, num_classes)
 
     def forward(self, x):
         return self.model(x)
+
 
 
 def freeze_except_deep(model):
