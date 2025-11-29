@@ -9,12 +9,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
+from multiprocessing import shared_memory
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
 
+
 # ============================================================
-# LOGGING (debug → stderr, accuracy → stdout)
+# LOGGING
 # ============================================================
 
 DEBUG = True
@@ -82,6 +84,7 @@ class ResNet18_Pretrained(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
         log_debug(f"[MODEL] Creating ResNet18 with {num_classes} classes")
+
         try:
             from torchvision.models import ResNet18_Weights
             self.model = models.resnet18(
@@ -90,7 +93,7 @@ class ResNet18_Pretrained(nn.Module):
             log_debug("[MODEL] Loaded IMAGENET1K_V1 weights")
         except Exception:
             self.model = models.resnet18(pretrained=True)
-            log_debug("[MODEL] Loaded pretrained=True (legacy API)")
+            log_debug("[MODEL] Loaded pretrained=True (legacy)")
 
         in_f = self.model.fc.in_features
         self.model.fc = nn.Linear(in_f, num_classes)
@@ -103,13 +106,48 @@ class ResNet18_Pretrained(nn.Module):
 
 
 # ============================================================
+# SHARED MEMORY HANDLERS
+# ============================================================
+
+def create_shared_tensor(t):
+    """
+    Create a shared memory block for a tensor t (CPU float32).
+    """
+    flat = t.contiguous().view(-1).numpy()
+    shm = shared_memory.SharedMemory(create=True, size=flat.nbytes)
+    np_sh = np.ndarray(flat.shape, dtype=flat.dtype, buffer=shm.buf)
+    np_sh[:] = flat[:]
+    return shm, flat.shape, t.shape
+
+
+def read_shared_tensor(shm_name, flat_shape, real_shape):
+    """
+    Read a shared tensor from shared memory.
+    """
+    shm = shared_memory.SharedMemory(name=shm_name)
+    np_arr = np.ndarray(flat_shape, dtype=np.float32, buffer=shm.buf)
+    t = torch.from_numpy(np_arr.copy()).view(real_shape)
+    return t
+
+
+def update_shared_tensor(shm_name, flat_shape, t):
+    """
+    Write an updated tensor t back to the shared memory block.
+    """
+    shm = shared_memory.SharedMemory(name=shm_name)
+    np_arr = np.ndarray(flat_shape, dtype=np.float32, buffer=shm.buf)
+    flat_new = t.contiguous().view(-1).numpy()
+    np_arr[:] = flat_new[:]
+
+
+# ============================================================
 # CLIENT UPDATE
 # ============================================================
 
 def client_update(model, device, train_idx, trainset,
                   c_local, c_global, lr):
 
-    log_debug(f"[CLIENT_UPDATE] Start | device={device} | lr={lr} | n_samples={len(train_idx)}")
+    log_debug(f"[CLIENT_UPDATE] lr={lr} | samples={len(train_idx)}")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     old_params = [p.detach().clone().cpu() for p in trainable]
@@ -122,11 +160,9 @@ def client_update(model, device, train_idx, trainset,
 
     opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
     E = len(loader)
-    log_debug(f"[CLIENT_UPDATE] Dataloader length E={E}")
 
     for ep in range(LOCAL_EPOCHS):
-        log_debug(f"[CLIENT_UPDATE] Epoch {ep+1}/{LOCAL_EPOCHS}")
-        for it, (x, y) in enumerate(loader):
+        for x, y in loader:
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
             out = model(x)
@@ -138,9 +174,6 @@ def client_update(model, device, train_idx, trainset,
 
             opt.step()
 
-            if DEBUG and it % 50 == 0:
-                log_debug(f"[CLIENT_UPDATE] Iter {it}, loss={loss.item():.4f}")
-
     new_params = [p.detach().clone().cpu() for p in trainable]
 
     delta_c = []
@@ -150,43 +183,46 @@ def client_update(model, device, train_idx, trainset,
         delta_c.append(dc)
         c_local[i] += dc
 
-    log_debug("[CLIENT_UPDATE] Done")
     return new_params, c_local, delta_c
 
 
 # ============================================================
-# WORKER LOOP
+# WORKER PROCESS
 # ============================================================
 
-def worker_loop(gpu_id, job_q, res_q, trainset, num_classes):
+def worker_loop(gpu_id, job_q, res_q, trainset, num_classes,
+                shm_info_list):
 
     torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
     log_debug(f"[WORKER {gpu_id}] Started on {device}")
 
+    # Load model ONCE
     model = ResNet18_Pretrained(num_classes).to(device)
-    log_debug(f"[WORKER {gpu_id}] Model ready")
+    trainable = [p for p in model.parameters() if p.requires_grad]
 
     while True:
-        log_debug(f"[WORKER {gpu_id}] Waiting for job...")
-        job = job_q.get()
-        log_debug(f"[WORKER {gpu_id}] Job received: {job[0]}")
+        msg = job_q.get()
 
-        if job[0] == "STOP":
-            log_debug(f"[WORKER {gpu_id}] STOP received → exit")
+        if msg[0] == "STOP":
+            log_debug(f"[WORKER {gpu_id}] STOP received")
             return
 
-        _, cid, train_idx, global_sd, c_local, c_global, lr = job
+        _, cid, train_idx, c_local, c_global, lr = msg
 
-        log_debug(f"[WORKER {gpu_id}] Loading global weights for client {cid}")
-        model.load_state_dict(global_sd)
+        # --- Load global params from shared memory ---
+        for i, (shm_name, flat_shape, real_shape) in enumerate(shm_info_list):
+            w = read_shared_tensor(shm_name, flat_shape, real_shape)
+            trainable[i].data.copy_(w.to(device))
 
-        log_debug(f"[WORKER {gpu_id}] Running update for client {cid}")
+        # --- Update client ---
         new_params, new_c_local, delta_c = client_update(
-            model, device, train_idx, trainset, c_local, c_global, lr
+            model, device, train_idx,
+            trainset,
+            c_local, c_global, lr
         )
 
-        log_debug(f"[WORKER {gpu_id}] Sending results for client {cid}")
+        # --- Return result ---
         res_q.put((cid, new_params, new_c_local, delta_c))
 
 
@@ -249,12 +285,12 @@ def load_dataset(name):
                              transform=transform_test)
         labels = train.labels
 
-    log_debug(f"[DATASET] Loaded {name} | train={len(train)}, test={len(test)}")
+    log_debug(f"[DATASET] Loaded {name}, train={len(train)}, test={len(test)}")
     return train, test, labels, num_classes
 
 
 # ============================================================
-# EVALUATION
+# EVALUATE
 # ============================================================
 
 def evaluate(model, loader, device):
@@ -264,21 +300,20 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            pred = model(x).argmax(1)
+            pred = model(x).argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
     return correct / total
 
 
 # ============================================================
-# FEDERATED TRAINING LOOP
+# FEDERATED LOOP
 # ============================================================
 
 def federated_run(dataset_name, gpus):
 
     print(f"\n========== DATASET: {dataset_name} ==========\n", flush=True)
 
-    log_debug("[FED] Loading dataset")
     trainset, testset, labels, num_classes = load_dataset(dataset_name)
     testloader = DataLoader(testset, batch_size=256, shuffle=False)
 
@@ -286,70 +321,70 @@ def federated_run(dataset_name, gpus):
 
         print(f"\n==== α = {alpha} ====\n", flush=True)
 
-        log_debug(f"[FED] Dirichlet split α={alpha}")
         splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
         device0 = "cuda:0"
-        log_debug("[FED] Creating global model")
         global_model = ResNet18_Pretrained(num_classes).to(device0)
-        global_sd = global_model.state_dict()
-
         trainable_params = [p for p in global_model.parameters() if p.requires_grad]
 
-        log_debug("[FED] Initializing SCAFFOLD buffers")
+        # =====================================================
+        # CREATE SHARED MEMORY FOR ALL GLOBAL PARAMETERS
+        # =====================================================
+        shm_info_list = []
+        for p in trainable_params:
+            shm, flat_shape, real_shape = create_shared_tensor(p.detach().cpu())
+            shm_info_list.append((shm.name, flat_shape, real_shape))
+
         c_global = [torch.zeros_like(p).cpu() for p in trainable_params]
         c_local = [[torch.zeros_like(p).cpu() for p in trainable_params]
                    for _ in range(NUM_CLIENTS)]
 
-        ctx = mp.get_context("fork")
+        # =====================================================
+        # START WORKERS
+        # =====================================================
+        ctx = mp.get_context("spawn")
         job_q = ctx.Queue()
         res_q = ctx.Queue()
 
-        log_debug(f"[FED] Starting {gpus} workers")
         workers = []
         for gpu in range(gpus):
             p = ctx.Process(
                 target=worker_loop,
-                args=(gpu, job_q, res_q, trainset, num_classes)
+                args=(gpu, job_q, res_q, trainset, num_classes,
+                      shm_info_list)
             )
             p.start()
             workers.append(p)
-        log_debug("[FED] Workers started")
 
+        # =====================================================
         # ROUNDS
+        # =====================================================
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
             print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
-            log_debug(f"[FED] ROUND {rnd} | lr={lr}")
 
-            log_debug("[FED] Preparing global state dict")
-            global_sd_cpu = {k: v.cpu() for k, v in global_sd.items()}
-
-            log_debug("[FED] Enqueue client jobs")
+            # PUT JOBS
             for cid in range(NUM_CLIENTS):
                 job_q.put((
                     "RUN",
                     cid,
                     splits[cid],
-                    global_sd_cpu,
                     c_local[cid],
                     c_global,
                     lr
                 ))
-                log_debug(f"[FED] Enqueued client {cid}")
 
-            log_debug("[FED] Collecting client results")
+            # COLLECT
             new_params_accum = None
-
-            for it in range(NUM_CLIENTS):
-                log_debug(f"[FED] Waiting result {it+1}/{NUM_CLIENTS}")
+            for _ in range(NUM_CLIENTS):
                 cid, new_params, new_c_local, delta_c = res_q.get()
-                log_debug(f"[FED] Received result for client {cid}")
                 c_local[cid] = new_c_local
 
                 if new_params_accum is None:
-                    new_params_accum = [torch.zeros_like(p) for p in new_params]
+                    new_params_accum = [
+                        torch.zeros_like(p) for p in new_params
+                    ]
 
                 for i in range(len(new_params)):
                     new_params_accum[i] += new_params[i]
@@ -357,27 +392,35 @@ def federated_run(dataset_name, gpus):
                 for i in range(len(c_global)):
                     c_global[i] += delta_c[i] / NUM_CLIENTS
 
-            log_debug("[FED] Aggregating results")
+            # AGGREGATE
             avg_params = [p / NUM_CLIENTS for p in new_params_accum]
 
+            # UPDATE GLOBAL MODEL
             idx = 0
             with torch.no_grad():
-                for name, param in global_model.named_parameters():
-                    if param.requires_grad:
-                        param.copy_(avg_params[idx].to(param.device))
-                        idx += 1
+                for p in trainable_params:
+                    p.copy_(avg_params[idx].to(device0))
+                    idx += 1
 
-            global_sd = global_model.state_dict()
+            # WRITE UPDATED PARAMS TO SHARED MEMORY
+            idx = 0
+            for p in trainable_params:
+                update_shared_tensor(
+                    shm_info_list[idx][0],
+                    shm_info_list[idx][1],
+                    p.detach().cpu()
+                )
+                idx += 1
 
+            # EVAL
             acc = evaluate(global_model, testloader, device0)
             log_accuracy(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-        log_debug("[FED] Stopping workers")
+        # STOP WORKERS
         for _ in range(gpus):
             job_q.put(("STOP",))
         for p in workers:
             p.join()
-        log_debug("[FED] Workers joined")
 
 
 # ============================================================
@@ -385,22 +428,16 @@ def federated_run(dataset_name, gpus):
 # ============================================================
 
 def main():
-    log_debug("[MAIN] Starting")
     set_seed(SEED)
 
-    mp.set_start_method("fork", force=True)
-    log_debug("[MAIN] mp start_method = fork")
+    mp.set_start_method("spawn", force=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1)
     args = parser.parse_args()
 
-    log_debug(f"[MAIN] Using {args.gpus} GPUs")
-
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
         federated_run(ds, args.gpus)
-
-    log_debug("[MAIN] Finished all datasets")
 
 
 if __name__ == "__main__":
