@@ -3,17 +3,17 @@
 
 import argparse
 import os
-import sys
-import time
-import random
 import subprocess
+import sys
+import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+
 
 
 # ======================================================================
@@ -22,12 +22,13 @@ from torch.utils.data import DataLoader
 
 DEBUG = True
 
-def logd(msg: str):
+def logd(msg):
     if DEBUG:
         print(msg, file=sys.stderr, flush=True)
 
-def loga(msg: str):
+def loga(msg):
     print(msg, file=sys.stdout, flush=True)
+
 
 
 # ======================================================================
@@ -45,17 +46,23 @@ BETA = 0.01
 SEED = 42
 
 
+
 # ======================================================================
-# UTILS
+# SET SEED
 # ======================================================================
 
-def set_seed(s: int):
+def set_seed(s):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+
+
+# ======================================================================
+# DIRICHLET SPLIT
+# ======================================================================
 
 def dirichlet_split(labels, n_clients, alpha):
     labels = np.array(labels)
@@ -77,21 +84,23 @@ def dirichlet_split(labels, n_clients, alpha):
     return per
 
 
+
 # ======================================================================
 # MODEL
 # ======================================================================
 
 class ResNet18Pre(nn.Module):
-    def __init__(self, nc: int):
+    def __init__(self, nc):
         super().__init__()
         try:
             from torchvision.models import ResNet18_Weights
             self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        except Exception:
+        except:
             self.m = models.resnet18(pretrained=True)
 
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
+
         for p in self.m.parameters():
             p.requires_grad = True
 
@@ -99,70 +108,106 @@ class ResNet18Pre(nn.Module):
         return self.m(x)
 
 
+
 # ======================================================================
-# DATA PREPROCESSING (TRAIN SET → TENSOR CACHE)
+# WORKER MODE (FAST, NO HUGE CACHE)
 # ======================================================================
 
-def preprocess_dataset(ds_name: str):
-    """
-    Preprocess train set ONCE per dataset:
-    save tensors in cached/{ds_name}_train_data.pt and _labels.pt.
-    """
-    os.makedirs("cached", exist_ok=True)
-    data_file = f"cached/{ds_name}_train_data.pt"
-    label_file = f"cached/{ds_name}_train_labels.pt"
+def client_update_worker(args):
 
-    if os.path.exists(data_file) and os.path.exists(label_file):
-        logd(f"[SERVER] Cached tensors for {ds_name} found. Skipping preprocess.")
-        X = torch.load(data_file)
-        y = torch.load(label_file)
-        return X, y
+    device = f"cuda:{args.gpu}"
+    logd(f"[WORKER {args.cid}] Starting on {device}")
 
-    logd(f"[SERVER] Preprocessing dataset {ds_name} ONCE...")
+    # --- Dataset (no caching) ---
+    T = transforms.Compose([
+        transforms.Resize(224),
+        transforms.ToTensor(),
+    ])
 
-    if ds_name == "CIFAR10":
-        T = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
+    if args.dataset == "CIFAR10":
         ds = datasets.CIFAR10("./data", train=True, download=True, transform=T)
-        X = torch.stack([ds[i][0] for i in range(len(ds))])
-        y = torch.tensor(ds.targets)
-
-    elif ds_name == "CIFAR100":
-        T = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
+    elif args.dataset == "CIFAR100":
         ds = datasets.CIFAR100("./data", train=True, download=True, transform=T)
-        X = torch.stack([ds[i][0] for i in range(len(ds))])
-        y = torch.tensor(ds.targets)
-
-    else:  # SVHN
+    else:
         from torchvision.datasets import SVHN
-        T = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
         ds = SVHN("./data", split="train", download=True, transform=T)
-        X = torch.stack([ds[i][0] for i in range(len(ds))])
-        y = torch.tensor(ds.labels)
 
-    torch.save(X, data_file)
-    torch.save(y, label_file)
+    idx = torch.load(args.train_idx)
+    subset = Subset(ds, idx)
 
-    logd(f"[SERVER] Preprocess {ds_name} completed.")
-    return X, y
+    loader = DataLoader(
+        subset,
+        batch_size=64,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # --- Model ---
+    nc = args.num_classes
+    model = ResNet18Pre(nc).to(device)
+
+    state_dict = torch.load(args.global_ckpt, map_location="cpu")
+    model.load_state_dict(state_dict)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+
+    # Control variates
+    c_state = torch.load(args.state_c, map_location="cpu")
+    c_global = c_state["c_global"]
+    c_local = c_state["c_local"][args.cid]
+
+    # Training
+    old_params = [p.detach().clone().cpu() for p in trainable]
+
+    lr = args.lr
+    opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
+
+    E = len(loader)
+
+    for _ in range(LOCAL_EPOCHS):
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            out = model(xb)
+            loss = nn.CrossEntropyLoss()(out, yb)
+            loss.backward()
+
+            # SCAFFOLD correction
+            for i, p in enumerate(trainable):
+                p.grad += (c_global[i].to(device) - c_local[i].to(device))
+
+            opt.step()
+
+    # Save updates
+    new_params = [p.detach().clone().cpu() for p in trainable]
+
+    delta_c = []
+    for i in range(len(new_params)):
+        diff = new_params[i] - old_params[i]
+        dc = BETA * (diff / max(E, 1))
+        delta_c.append(dc)
+        c_local[i] += dc
+
+    torch.save({
+        "cid": args.cid,
+        "new_params": new_params,
+        "new_c_local": c_local,
+        "delta_c": delta_c,
+    }, args.output)
+
+    logd(f"[WORKER {args.cid}] Done")
+    return
+
 
 
 # ======================================================================
-# EVAL
+# EVALUATE
 # ======================================================================
 
 def evaluate(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
+    correct = total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -172,295 +217,168 @@ def evaluate(model, loader, device):
     return correct / total
 
 
-# ======================================================================
-# PERSISTENT WORKER (1 PER GPU)
-# ======================================================================
-
-def persistent_worker(gpu: int, dataset_name: str):
-    """
-    Worker persistente: gira finché non riceve "STOP",
-    leggendo i job da jobs/worker_{gpu}.queue
-    """
-    device = f"cuda:{gpu}"
-    logd(f"[WORKER GPU {gpu}] Started. Device={device}, dataset={dataset_name}")
-
-    # Load cached dataset ONCE
-    X = torch.load(f"cached/{dataset_name}_train_data.pt")
-    y = torch.load(f"cached/{dataset_name}_train_labels.pt")
-
-    queue_file = f"jobs/worker_{gpu}.queue"
-
-    while True:
-        # Wait for job file
-        while not os.path.exists(queue_file):
-            time.sleep(0.1)
-
-        with open(queue_file, "r") as f:
-            job = f.read().strip()
-
-        # Clear queue file ASAP
-        os.remove(queue_file)
-
-        if job == "STOP":
-            logd(f"[WORKER GPU {gpu}] STOP received. Exiting.")
-            return
-
-        # job format:
-        # cid,nc,global_ckpt,state_c_path,idx_path,lr,out_path
-        cid_str, nc_str, gckpt, statec, idx_path, lr_str, out_path = job.split(",")
-        cid = int(cid_str)
-        nc = int(nc_str)
-        lr = float(lr_str)
-
-        logd(f"[WORKER GPU {gpu}] Starting job cid={cid}, lr={lr}")
-
-        # Load model
-        model = ResNet18Pre(nc).to(device)
-        model.load_state_dict(torch.load(gckpt, map_location="cpu"))
-        trainable = [p for p in model.parameters() if p.requires_grad]
-
-        # Load control variates
-        s = torch.load(statec, map_location="cpu")
-        c_global = s["c_global"]           # list of tensors
-        c_local = s["c_local"][cid]        # list of tensors (this client)
-
-        # Load indices & build client dataset
-        idx = torch.load(idx_path)
-        Xc = X[idx]
-        yc = y[idx]
-
-        loader = torch.utils.data.DataLoader(
-            list(zip(Xc, yc)),
-            batch_size=BATCH,
-            shuffle=True
-        )
-
-        old_params = [p.detach().clone().cpu() for p in trainable]
-        opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
-
-        E = len(loader)
-        for _ in range(LOCAL_EPOCHS):
-            for xb, yb in loader:
-                xb, yb = xb.to(device), yb.to(device)
-                opt.zero_grad()
-                out = model(xb)
-                loss = nn.CrossEntropyLoss()(out, yb)
-                loss.backward()
-                # SCAFFOLD correction
-                for i, p in enumerate(trainable):
-                    p.grad += (c_global[i].to(device) - c_local[i].to(device))
-                opt.step()
-
-        new_params = [p.detach().clone().cpu() for p in trainable]
-
-        delta_c = []
-        for i in range(len(new_params)):
-            diff = new_params[i] - old_params[i]
-            dc = BETA * (diff / max(E, 1))
-            delta_c.append(dc)
-            c_local[i] += dc
-
-        torch.save({
-            "cid": cid,
-            "new_params": new_params,
-            "new_c_local": c_local,
-            "delta_c": delta_c,
-        }, out_path)
-
-        logd(f"[WORKER GPU {gpu}] Finished job cid={cid}")
-
 
 # ======================================================================
-# FEDERATED SERVER LOOP
+# FEDERATED LOOP
 # ======================================================================
 
-def federated_run(ds_name: str, gpus: int):
+def federated_run(ds_name, gpus):
+
     print(f"\n========== DATASET: {ds_name} ==========\n", flush=True)
 
-    # Preprocess train set once
-    _, y = preprocess_dataset(ds_name)
-
-    # Load test set for evaluation
+    # -----------------------------
+    # TEST SET (unchanged)
+    # -----------------------------
     if ds_name == "CIFAR10":
         nc = 10
-        Tte = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
-        te = datasets.CIFAR10("./data", train=False, download=True, transform=Tte)
+        T = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
+        te = datasets.CIFAR10("./data", train=False, download=True, transform=T)
+
     elif ds_name == "CIFAR100":
         nc = 100
-        Tte = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
-        te = datasets.CIFAR100("./data", train=False, download=True, transform=Tte)
+        T = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
+        te = datasets.CIFAR100("./data", train=False, download=True, transform=T)
+
     else:
-        from torchvision.datasets import SVHN
         nc = 10
-        Tte = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
-        te = SVHN("./data", split="test", download=True, transform=Tte)
+        from torchvision.datasets import SVHN
+        T = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
+        te = SVHN("./data", split="test", download=True, transform=T)
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
 
-    # Prepare directories
-    os.makedirs("global_ckpt", exist_ok=True)
-    os.makedirs("client_updates", exist_ok=True)
-    os.makedirs("jobs", exist_ok=True)
 
-    # Clean jobs directory
-    for f in os.listdir("jobs"):
-        os.remove(os.path.join("jobs", f))
 
-    # Spawn persistent workers for this dataset
-    workers = []
-    for gpu in range(gpus):
-        cmd = [
-            sys.executable,
-            "main.py",
-            "--persistent-worker",
-            "--gpu", str(gpu),
-            "--dataset", ds_name,
-        ]
-        p = subprocess.Popen(cmd)
-        workers.append(p)
+    # -----------------------------------------
+    # Load training labels once (small, fast)
+    # -----------------------------------------
+    if ds_name == "CIFAR10":
+        tmp = datasets.CIFAR10("./data", train=True, download=True)
+        labels = np.array(tmp.targets)
 
-    labels_np = y.numpy()
+    elif ds_name == "CIFAR100":
+        tmp = datasets.CIFAR100("./data", train=True, download=True)
+        labels = np.array(tmp.targets)
+
+    else:
+        from torchvision.datasets import SVHN
+        tmp = SVHN("./data", split="train", download=True)
+        labels = np.array(tmp.labels)
+
+
 
     for alpha in DIR_ALPHAS:
 
         print(f"\n==== α = {alpha} ====\n", flush=True)
 
-        splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
+        splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
-        # Initialize global model for this alpha
+        # GLOBAL MODEL
         device0 = "cuda:0"
         global_model = ResNet18Pre(nc).to(device0)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
-        # Init control variates
+        # Initial save
+        os.makedirs("global_ckpt", exist_ok=True)
+        ckpt_path = "global_ckpt/global_round_0.pth"
+        torch.save(global_model.state_dict(), ckpt_path)
+
+        # Control variates
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
-        c_local = [
-            [torch.zeros_like(p).cpu() for p in trainable]
-            for _ in range(NUM_CLIENTS)
-        ]
+        c_local = [[torch.zeros_like(p).cpu() for p in trainable]
+                   for _ in range(NUM_CLIENTS)]
 
-        # Save initial global model
-        ckpt_path_prev = f"global_ckpt/{ds_name}_alpha{alpha}_round0.pth"
-        torch.save(global_model.state_dict(), ckpt_path_prev)
-
+        # --------------------------
         # ROUNDS
+        # --------------------------
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR0 if rnd <= LR_DECAY else LR0 * 0.1
             print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
 
-            # Save control variates for this round
-            state_c_path = f"global_ckpt/{ds_name}_alpha{alpha}_state_c_r{rnd}.pth"
+            # Save control variates
+            state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # Save train indices (one per client, static over rounds)
+            # Save train index files
             idx_paths = []
             for cid in range(NUM_CLIENTS):
-                idx_path = f"global_ckpt/{ds_name}_alpha{alpha}_cid{cid}_idx.pth"
-                if not os.path.exists(idx_path):
-                    torch.save(splits[cid], idx_path)
-                idx_paths.append(idx_path)
+                p = f"global_ckpt/train_idx_{cid}.pth"
+                torch.save(splits[cid], p)
+                idx_paths.append(p)
 
-            # Use last global checkpoint as base
-            ckpt_path = ckpt_path_prev
+            # Save global model
+            ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
+            torch.save(global_model.state_dict(), ckpt_path)
 
-            # Prepare output paths for this round
-            out_paths = {
-                cid: f"client_updates/{ds_name}_alpha{alpha}_cid{cid}_r{rnd}.pth"
-                for cid in range(NUM_CLIENTS)
-            }
+            # ---------------------------
+            # Launch worker subprocesses
+            # ---------------------------
+            os.makedirs("client_updates", exist_ok=True)
+            procs = []
+            out_paths = []
 
-            # ---- JOB SCHEDULING over persistent workers ----
+            for cid in range(NUM_CLIENTS):
+                gpu = cid % gpus
+                outp = f"client_updates/cid_{cid}_r{rnd}.pth"
+                out_paths.append(outp)
 
-            pending = list(range(NUM_CLIENTS))
-            completed = set()
+                cmd = [
+                    sys.executable, "main.py",
+                    "--worker",
+                    "--dataset", ds_name,
+                    "--num_classes", str(nc),
+                    "--cid", str(cid),
+                    "--gpu", str(gpu),
+                    "--global_ckpt", ckpt_path,
+                    "--state_c", state_c_path,
+                    "--train_idx", idx_paths[cid],
+                    "--lr", str(lr),
+                    "--output", outp,
+                    "--gpus", str(gpus)
+                ]
 
-            while len(completed) < NUM_CLIENTS:
-                # Assign jobs to free workers
-                for gpu in range(gpus):
-                    qfile = f"jobs/worker_{gpu}.queue"
-                    if not pending:
-                        break
-                    if not os.path.exists(qfile):
-                        cid = pending.pop(0)
-                        job_line = ",".join([
-                            str(cid),
-                            str(nc),
-                            ckpt_path,
-                            state_c_path,
-                            idx_paths[cid],
-                            str(lr),
-                            out_paths[cid],
-                        ])
-                        with open(qfile, "w") as f:
-                            f.write(job_line)
+                procs.append(subprocess.Popen(cmd))
 
-                # Check which jobs finished
-                for cid in range(NUM_CLIENTS):
-                    if cid in completed:
-                        continue
-                    if os.path.exists(out_paths[cid]):
-                        completed.add(cid)
+            for p in procs:
+                p.wait()
 
-                if len(completed) < NUM_CLIENTS:
-                    time.sleep(0.2)
+            # ---------------------------
+            # Aggregate
+            # ---------------------------
+            updates = [torch.load(out_paths[c], map_location="cpu")
+                       for c in range(NUM_CLIENTS)]
 
-            # ---- All client updates are ready ----
+            new_acc = None
+            for u in updates:
+                if new_acc is None:
+                    new_acc = [torch.zeros_like(p) for p in u["new_params"]]
+                for i, p in enumerate(u["new_params"]):
+                    new_acc[i] += p
 
-            updates = [
-                torch.load(out_paths[cid], map_location="cpu")
-                for cid in range(NUM_CLIENTS)
-            ]
+            avg_params = [p / NUM_CLIENTS for p in new_acc]
 
-            # Aggregate params
-            new_params_acc = None
-            for upd in updates:
-                if new_params_acc is None:
-                    new_params_acc = [
-                        torch.zeros_like(p) for p in upd["new_params"]
-                    ]
-                for i, p in enumerate(upd["new_params"]):
-                    new_params_acc[i] += p
-
-            avg_params = [p / NUM_CLIENTS for p in new_params_acc]
-
-            # Load into global model
-            idx_param = 0
+            idx = 0
             with torch.no_grad():
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[idx_param].to(device0))
-                        idx_param += 1
+                        p.copy_(avg_params[idx].to(device0))
+                        idx += 1
 
-            # Update c_global
+            # Update control variates
             for i in range(len(c_global)):
-                c_global[i] = sum(
-                    upd["delta_c"][i] for upd in updates
-                ) / NUM_CLIENTS
+                c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
-            # Update c_local
-            for upd in updates:
-                cid = upd["cid"]
-                c_local[cid] = upd["new_c_local"]
+            for u in updates:
+                c_local[u["cid"]] = u["new_c_local"]
 
-            # Save new global model
-            ckpt_path_prev = f"global_ckpt/{ds_name}_alpha{alpha}_round{rnd}.pth"
-            torch.save(global_model.state_dict(), ckpt_path_prev)
+            # Save new model
+            ckpt_path = f"global_ckpt/global_round_{rnd}.pth"
+            torch.save(global_model.state_dict(), ckpt_path)
 
             # Eval
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
-
-    # After all α, send STOP to workers
-    for gpu in range(gpus):
-        qfile = f"jobs/worker_{gpu}.queue"
-        with open(qfile, "w") as f:
-            f.write("STOP")
-
-    for p in workers:
-        p.wait()
-
-    logd(f"[SERVER] Finished dataset {ds_name}")
 
 
 # ======================================================================
@@ -469,22 +387,23 @@ def federated_run(ds_name: str, gpus: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--persistent-worker", action="store_true")
-    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--worker", action="store_true")
     parser.add_argument("--dataset", type=str)
+    parser.add_argument("--num_classes", type=int)
+    parser.add_argument("--cid", type=int)
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--global_ckpt", type=str)
+    parser.add_argument("--state_c", type=str)
+    parser.add_argument("--train_idx", type=str)
+    parser.add_argument("--output", type=str)
+    parser.add_argument("--lr", type=float)
     parser.add_argument("--gpus", type=int, default=1)
 
     args = parser.parse_args()
 
-    # Worker mode
-    if args.persistent_worker:
-        if args.dataset is None:
-            raise ValueError("Worker mode requires --dataset")
-        set_seed(SEED)
-        persistent_worker(args.gpu, args.dataset)
-        return
+    if args.worker:
+        return client_update_worker(args)
 
-    # Server mode
     set_seed(SEED)
 
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
