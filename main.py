@@ -4,6 +4,7 @@
 import argparse
 import random
 import numpy as np
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +12,20 @@ import torch.multiprocessing as mp
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
+
+# ============================================================
+# LOGGING (debug → stderr, accuracy → stdout)
+# ============================================================
+
+DEBUG = True
+
+def log_debug(msg):
+    if DEBUG:
+        print(msg, file=sys.stderr, flush=True)
+
+def log_accuracy(msg):
+    print(msg, file=sys.stdout, flush=True)
+
 
 # ============================================================
 # CONFIG
@@ -25,8 +40,6 @@ LR_INIT = 0.01
 LR_DECAY_ROUND = 50
 BETA = 0.01
 SEED = 42
-
-torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 # ============================================================
@@ -68,18 +81,20 @@ def dirichlet_split(labels, n_clients, alpha):
 class ResNet18_Pretrained(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
+        log_debug(f"[MODEL] Creating ResNet18 with {num_classes} classes")
         try:
             from torchvision.models import ResNet18_Weights
             self.model = models.resnet18(
                 weights=ResNet18_Weights.IMAGENET1K_V1
             )
+            log_debug("[MODEL] Loaded IMAGENET1K_V1 weights")
         except Exception:
             self.model = models.resnet18(pretrained=True)
+            log_debug("[MODEL] Loaded pretrained=True (legacy API)")
 
         in_f = self.model.fc.in_features
         self.model.fc = nn.Linear(in_f, num_classes)
 
-        # Solution A: train all parameters
         for p in self.model.parameters():
             p.requires_grad = True
 
@@ -87,39 +102,17 @@ class ResNet18_Pretrained(nn.Module):
         return self.model(x)
 
 
-def get_trainable_params(model):
-    return [p.detach().cpu().clone() for p in model.parameters()
-            if p.requires_grad]
-
-
-def set_trainable_params(model, params):
-    idx = 0
-    for p in model.parameters():
-        if p.requires_grad:
-            p.data = params[idx].clone().to(p.device)
-            idx += 1
-
-
-def zero_like_trainable(model):
-    return [torch.zeros_like(p).cpu() for p in model.parameters()
-            if p.requires_grad]
-
-
 # ============================================================
 # CLIENT UPDATE
 # ============================================================
 
-def client_update(gpu_id, client_id, train_idx, trainset, global_params,
-                  c_local, c_global, lr, num_classes, result_queue):
+def client_update(model, device, train_idx, trainset,
+                  c_local, c_global, lr):
 
-    torch.cuda.set_device(gpu_id)
-    device = f"cuda:{gpu_id}"
-
-    model = ResNet18_Pretrained(num_classes).to(device)
+    log_debug(f"[CLIENT_UPDATE] Start | device={device} | lr={lr} | n_samples={len(train_idx)}")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    for p, new in zip(trainable, global_params):
-        p.data = new.clone().to(device)
+    old_params = [p.detach().clone().cpu() for p in trainable]
 
     loader = DataLoader(
         Subset(trainset, train_idx),
@@ -127,26 +120,28 @@ def client_update(gpu_id, client_id, train_idx, trainset, global_params,
         shuffle=True
     )
 
-    old_params = [p.detach().clone().cpu() for p in trainable]
-
     opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
     E = len(loader)
+    log_debug(f"[CLIENT_UPDATE] Dataloader length E={E}")
 
-    for _ in range(LOCAL_EPOCHS):
-        for x, y in loader:
+    for ep in range(LOCAL_EPOCHS):
+        log_debug(f"[CLIENT_UPDATE] Epoch {ep+1}/{LOCAL_EPOCHS}")
+        for it, (x, y) in enumerate(loader):
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
             out = model(x)
             loss = nn.CrossEntropyLoss()(out, y)
             loss.backward()
 
-            # SCAFFOLD correction
             for i, p in enumerate(trainable):
                 p.grad += (c_global[i].to(device) - c_local[i].to(device))
 
             opt.step()
 
-    new_params = [p.detach().cpu().clone() for p in trainable]
+            if DEBUG and it % 50 == 0:
+                log_debug(f"[CLIENT_UPDATE] Iter {it}, loss={loss.item():.4f}")
+
+    new_params = [p.detach().clone().cpu() for p in trainable]
 
     delta_c = []
     for i in range(len(new_params)):
@@ -155,40 +150,53 @@ def client_update(gpu_id, client_id, train_idx, trainset, global_params,
         delta_c.append(dc)
         c_local[i] += dc
 
-    result_queue.put((client_id, new_params, c_local, delta_c))
+    log_debug("[CLIENT_UPDATE] Done")
+    return new_params, c_local, delta_c
 
 
 # ============================================================
-# WORKER (1 per GPU)
+# WORKER LOOP
 # ============================================================
 
-def worker_loop(gpu_id, task_queue, result_queue, trainset, num_classes):
+def worker_loop(gpu_id, job_q, res_q, trainset, num_classes):
 
     torch.cuda.set_device(gpu_id)
+    device = f"cuda:{gpu_id}"
+    log_debug(f"[WORKER {gpu_id}] Started on {device}")
+
+    model = ResNet18_Pretrained(num_classes).to(device)
+    log_debug(f"[WORKER {gpu_id}] Model ready")
 
     while True:
-        job = task_queue.get()
+        log_debug(f"[WORKER {gpu_id}] Waiting for job...")
+        job = job_q.get()
+        log_debug(f"[WORKER {gpu_id}] Job received: {job[0]}")
 
         if job[0] == "STOP":
+            log_debug(f"[WORKER {gpu_id}] STOP received → exit")
             return
 
-        _, cid, train_idx, global_params, c_local, c_global, lr = job
+        _, cid, train_idx, global_sd, c_local, c_global, lr = job
 
-        client_update(
-            gpu_id, cid, train_idx, trainset,
-            global_params, c_local, c_global, lr,
-            num_classes, result_queue
+        log_debug(f"[WORKER {gpu_id}] Loading global weights for client {cid}")
+        model.load_state_dict(global_sd)
+
+        log_debug(f"[WORKER {gpu_id}] Running update for client {cid}")
+        new_params, new_c_local, delta_c = client_update(
+            model, device, train_idx, trainset, c_local, c_global, lr
         )
 
+        log_debug(f"[WORKER {gpu_id}] Sending results for client {cid}")
+        res_q.put((cid, new_params, new_c_local, delta_c))
+
 
 # ============================================================
-# DATASET LOADING
+# DATASET
 # ============================================================
-
-from torchvision import transforms, datasets
-
 
 def load_dataset(name):
+    log_debug(f"[DATASET] Loading {name}")
+
     if name == "CIFAR10":
         num_classes = 10
         transform_train = transforms.Compose([
@@ -225,7 +233,7 @@ def load_dataset(name):
                                  transform=transform_test)
         labels = train.targets
 
-    else:  # SVHN
+    else:
         num_classes = 10
         transform_train = transforms.Compose([
             transforms.Resize(224),
@@ -241,11 +249,12 @@ def load_dataset(name):
                              transform=transform_test)
         labels = train.labels
 
+    log_debug(f"[DATASET] Loaded {name} | train={len(train)}, test={len(test)}")
     return train, test, labels, num_classes
 
 
 # ============================================================
-# EVALUATION  ✅ (questa mancava / era fuori posto)
+# EVALUATION
 # ============================================================
 
 def evaluate(model, loader, device):
@@ -262,92 +271,113 @@ def evaluate(model, loader, device):
 
 
 # ============================================================
-# FEDERATED SERVER
+# FEDERATED TRAINING LOOP
 # ============================================================
 
 def federated_run(dataset_name, gpus):
 
-    print(f"\n========== DATASET: {dataset_name} ==========\n")
+    print(f"\n========== DATASET: {dataset_name} ==========\n", flush=True)
 
+    log_debug("[FED] Loading dataset")
     trainset, testset, labels, num_classes = load_dataset(dataset_name)
     testloader = DataLoader(testset, batch_size=256, shuffle=False)
 
     for alpha in DIRICHLET_ALPHAS:
 
-        print(f"\n==== α = {alpha} ====\n")
+        print(f"\n==== α = {alpha} ====\n", flush=True)
 
+        log_debug(f"[FED] Dirichlet split α={alpha}")
         splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
         device0 = "cuda:0"
+        log_debug("[FED] Creating global model")
         global_model = ResNet18_Pretrained(num_classes).to(device0)
+        global_sd = global_model.state_dict()
 
-        global_params = get_trainable_params(global_model)
-        c_global = zero_like_trainable(global_model)
-        c_local = [zero_like_trainable(global_model)
+        trainable_params = [p for p in global_model.parameters() if p.requires_grad]
+
+        log_debug("[FED] Initializing SCAFFOLD buffers")
+        c_global = [torch.zeros_like(p).cpu() for p in trainable_params]
+        c_local = [[torch.zeros_like(p).cpu() for p in trainable_params]
                    for _ in range(NUM_CLIENTS)]
 
-        ctx = mp.get_context("spawn")
-        task_queue = ctx.Queue(maxsize=gpus)
-        result_queue = ctx.Queue(maxsize=gpus)
+        ctx = mp.get_context("fork")
+        job_q = ctx.Queue()
+        res_q = ctx.Queue()
 
-        # ---- start workers ----
+        log_debug(f"[FED] Starting {gpus} workers")
         workers = []
         for gpu in range(gpus):
             p = ctx.Process(
                 target=worker_loop,
-                args=(gpu, task_queue, result_queue, trainset, num_classes)
+                args=(gpu, job_q, res_q, trainset, num_classes)
             )
             p.start()
             workers.append(p)
+        log_debug("[FED] Workers started")
 
-        # ---- federated rounds ----
+        # ROUNDS
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
-            print(f"\n--- ROUND {rnd}/{NUM_ROUNDS} ---")
+            print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
+            log_debug(f"[FED] ROUND {rnd} | lr={lr}")
 
-            next_client = 0
-            finished = 0
-            accum = None
+            log_debug("[FED] Preparing global state dict")
+            global_sd_cpu = {k: v.cpu() for k, v in global_sd.items()}
 
-            while finished < NUM_CLIENTS:
+            log_debug("[FED] Enqueue client jobs")
+            for cid in range(NUM_CLIENTS):
+                job_q.put((
+                    "RUN",
+                    cid,
+                    splits[cid],
+                    global_sd_cpu,
+                    c_local[cid],
+                    c_global,
+                    lr
+                ))
+                log_debug(f"[FED] Enqueued client {cid}")
 
-                while next_client < NUM_CLIENTS and not task_queue.full():
-                    cid = next_client
-                    next_client += 1
+            log_debug("[FED] Collecting client results")
+            new_params_accum = None
 
-                    task_queue.put((
-                        "RUN",
-                        cid,
-                        splits[cid],
-                        global_params,
-                        c_local[cid],
-                        c_global,
-                        lr
-                    ))
-
-                cid, new_params, new_c_local, delta_c = result_queue.get()
+            for it in range(NUM_CLIENTS):
+                log_debug(f"[FED] Waiting result {it+1}/{NUM_CLIENTS}")
+                cid, new_params, new_c_local, delta_c = res_q.get()
+                log_debug(f"[FED] Received result for client {cid}")
                 c_local[cid] = new_c_local
 
-                if accum is None:
-                    accum = [torch.zeros_like(new_params[i])
-                             for i in range(len(new_params))]
+                if new_params_accum is None:
+                    new_params_accum = [torch.zeros_like(p) for p in new_params]
 
-                for i in range(len(accum)):
-                    accum[i] += new_params[i]
+                for i in range(len(new_params)):
+                    new_params_accum[i] += new_params[i]
 
-                finished += 1
+                for i in range(len(c_global)):
+                    c_global[i] += delta_c[i] / NUM_CLIENTS
 
-            global_params = [p / NUM_CLIENTS for p in accum]
-            set_trainable_params(global_model, global_params)
+            log_debug("[FED] Aggregating results")
+            avg_params = [p / NUM_CLIENTS for p in new_params_accum]
+
+            idx = 0
+            with torch.no_grad():
+                for name, param in global_model.named_parameters():
+                    if param.requires_grad:
+                        param.copy_(avg_params[idx].to(param.device))
+                        idx += 1
+
+            global_sd = global_model.state_dict()
 
             acc = evaluate(global_model, testloader, device0)
-            print(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
+            log_accuracy(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
+        log_debug("[FED] Stopping workers")
         for _ in range(gpus):
-            task_queue.put(("STOP",))
+            job_q.put(("STOP",))
         for p in workers:
             p.join()
+        log_debug("[FED] Workers joined")
 
 
 # ============================================================
@@ -355,19 +385,26 @@ def federated_run(dataset_name, gpus):
 # ============================================================
 
 def main():
-    mp.set_start_method("spawn", force=True)
+    log_debug("[MAIN] Starting")
+    set_seed(SEED)
+
+    mp.set_start_method("fork", force=True)
+    log_debug("[MAIN] mp start_method = fork")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpus", type=int, default=1)
     args = parser.parse_args()
 
-    set_seed(SEED)
+    log_debug(f"[MAIN] Using {args.gpus} GPUs")
 
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
         federated_run(ds, args.gpus)
 
+    log_debug("[MAIN] Finished all datasets")
+
 
 if __name__ == "__main__":
     main()
+
 
 
