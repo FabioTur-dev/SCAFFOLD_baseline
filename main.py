@@ -10,45 +10,43 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
 
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
-import time
+from torchvision.transforms.functional import to_pil_image
 
-
-# ======================================================================
-# CONFIG — SCAFFOLD-Lite++ (87%)
-# ======================================================================
+# ==============================================================
+# CONFIG (SCAFFOLD-Lite Stable)
+# ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5]
+DIR_ALPHAS = [0.5]   # puoi aggiungere 0.1,0.05
 NUM_ROUNDS = 100
 LOCAL_EPOCHS = 2
 BATCH = 128
 
 LR_INIT = 0.003
+LR_DECAY_ROUND = 15
+
 BETA = 0.01
 DAMPING = 0.1
 GRAD_CLIP = 5.0
-EMA_DECAY = 0.995
-
 SEED = 42
 
-
-# ======================================================================
-# LOGGING
-# ======================================================================
+# ==============================================================
+# LOGGING — only accuracy per round
+# ==============================================================
 
 def loga(msg):
     print(msg, flush=True)
 
 def logd(msg):
-    pass
+    pass    # debug off
 
-
-# ======================================================================
+# ==============================================================
 # SEED
-# ======================================================================
+# ==============================================================
 
 def set_seed(s):
     random.seed(s)
@@ -57,10 +55,9 @@ def set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
-
-# ======================================================================
-# RAW DATASET (Cached)
-# ======================================================================
+# ==============================================================
+# RAW DATASET WRAPPER (dynamic augmentation)
+# ==============================================================
 
 class RawDataset(Dataset):
     def __init__(self, data, labels, indices, augment=False):
@@ -76,7 +73,7 @@ class RawDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
-                transforms.RandomErasing(p=0.25, scale=(0.02,0.2))
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
@@ -91,18 +88,69 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]
+        img = to_pil_image(self.data[idx])   # <<< fondamentale per CIFAR
         return self.T(img), self.labels[idx]
 
+# ==============================================================
+# DIRICHLET SPLIT
+# ==============================================================
+
+def dirichlet_split(labels, n_clients, alpha):
+    labels = np.array(labels)
+    per = [[] for _ in range(n_clients)]
+    classes = np.unique(labels)
+
+    for c in classes:
+        idx = np.where(labels == c)[0]
+        np.random.shuffle(idx)
+        p = np.random.dirichlet([alpha] * n_clients)
+        cuts = (np.cumsum(p) * len(idx)).astype(int)
+        chunks = np.split(idx, cuts[:-1])
+        for i in range(n_clients):
+            per[i].extend(chunks[i])
+
+    for cl in per:
+        random.shuffle(cl)
+
+    return per
+
+# ==============================================================
+# MODEL
+# ==============================================================
+
+class ResNet18Pre(nn.Module):
+    def __init__(self, nc):
+        super().__init__()
+        try:
+            from torchvision.models import ResNet18_Weights
+            self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        except:
+            self.m = models.resnet18(pretrained=True)
+
+        in_f = self.m.fc.in_features
+        self.m.fc = nn.Linear(in_f, nc)
+
+        # freeze everything except last third
+        for name, p in self.m.named_parameters():
+            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
+    def forward(self, x):
+        return self.m(x)
+
+# ==============================================================
+# PREPROCESS RAW DATASET ONCE
+# ==============================================================
 
 def preprocess_raw_dataset(ds_name):
     os.makedirs("cached", exist_ok=True)
+    data_file = f"cached/{ds_name}_train_raw.pt"
+    label_file = f"cached/{ds_name}_train_labels.pt"
 
-    df = f"cached/{ds_name}_data.pt"
-    lf = f"cached/{ds_name}_labels.pt"
-
-    if os.path.exists(df) and os.path.exists(lf):
-        return torch.load(df), torch.load(lf)
+    if os.path.exists(data_file) and os.path.exists(label_file):
+        return torch.load(data_file), torch.load(label_file)
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
@@ -118,82 +166,24 @@ def preprocess_raw_dataset(ds_name):
         data = torch.tensor(d.data).permute(0,3,1,2)
         labels = torch.tensor(d.labels)
 
-    torch.save(data, df)
-    torch.save(labels, lf)
-
+    torch.save(data, data_file)
+    torch.save(labels, label_file)
     return data, labels
 
-
-# ======================================================================
-# DIRICHLET
-# ======================================================================
-
-def dirichlet_split(labels, n_clients, alpha):
-    labels = np.array(labels)
-    per = [[] for _ in range(n_clients)]
-    classes = np.unique(labels)
-
-    for c in classes:
-        idx = np.where(labels == c)[0]
-        np.random.shuffle(idx)
-        p = np.random.dirichlet([alpha]*n_clients)
-        cuts = (np.cumsum(p) * len(idx)).astype(int)
-        chunks = np.split(idx, cuts[:-1])
-        for i in range(n_clients):
-            per[i].extend(chunks[i])
-
-    for L in per:
-        random.shuffle(L)
-
-    return per
-
-
-# ======================================================================
-# MODEL — fine-tune only last blocks
-# ======================================================================
-
-class ResNet18Pre(nn.Module):
-    def __init__(self, nc):
-        super().__init__()
-
-        # Try new torchvision API
-        try:
-            from torchvision.models import ResNet18_Weights
-            self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-        except Exception:
-            # Fall back to old API
-            self.m = models.resnet18(pretrained=True)
-
-        # Replace FC
-        in_f = self.m.fc.in_features
-        self.m.fc = nn.Linear(in_f, nc)
-
-        # Freeze all except last blocks (SCAFFOLD-Lite++)
-        for name, p in self.m.named_parameters():
-            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
-
-    def forward(self, x):
-        return self.m(x)
-
-
-
-# ======================================================================
-# WORKER
-# ======================================================================
+# ==============================================================
+# WORKER — SCAFFOLD-Lite + Dynamic Augmentation
+# ==============================================================
 
 def client_update_worker(args):
     device = f"cuda:{args.gpu}"
 
-    # load cached raw data
-    data = torch.load(f"cached/{args.dataset}_data.pt")
-    labels = torch.load(f"cached/{args.dataset}_labels.pt")
+    data = torch.load(f"cached/{args.dataset}_train_raw.pt")
+    labels = torch.load(f"cached/{args.dataset}_train_labels.pt")
     indices = torch.load(args.train_idx)
 
     ds = RawDataset(data, labels, indices, augment=True)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=2, pin_memory=True)
+    loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
+                        num_workers=2, pin_memory=True)
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
@@ -206,21 +196,18 @@ def client_update_worker(args):
 
     old_params = [p.detach().clone().cpu() for p in trainable]
 
-    loss_fn = nn.CrossEntropyLoss()
     opt = optim.SGD(trainable, lr=args.lr, momentum=0.9, weight_decay=5e-4)
-
+    loss_fn = nn.CrossEntropyLoss()
     E = len(loader)
 
     for _ in range(LOCAL_EPOCHS):
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-
             opt.zero_grad()
             out = model(xb)
             loss = loss_fn(out, yb)
             loss.backward()
 
-            # SCAFFOLD-Lite++
             for i, p in enumerate(trainable):
                 p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
@@ -228,11 +215,11 @@ def client_update_worker(args):
             opt.step()
 
     new_params = [p.detach().clone().cpu() for p in trainable]
-    delta_c = []
 
+    delta_c = []
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
-        dc = BETA * (diff / max(E,1))
+        dc = BETA * (diff / max(E, 1))
         delta_c.append(dc)
         c_local[i] += dc
 
@@ -240,15 +227,14 @@ def client_update_worker(args):
         "cid": args.cid,
         "new_params": new_params,
         "new_c_local": c_local,
-        "delta_c": delta_c
+        "delta_c": delta_c,
     }, args.output)
 
     return
 
-
-# ======================================================================
-# EVAL
-# ======================================================================
+# ==============================================================
+# EVALUATION
+# ==============================================================
 
 def evaluate(model, loader, device):
     model.eval()
@@ -261,32 +247,16 @@ def evaluate(model, loader, device):
             total += y.size(0)
     return correct / total
 
-
-# ======================================================================
-# EMA UPDATE
-# ======================================================================
-
-def ema_update(global_model, ema_model):
-    with torch.no_grad():
-        for p, q in zip(global_model.parameters(), ema_model.parameters()):
-            q.data = EMA_DECAY * q.data + (1-EMA_DECAY) * p.data
-
-
-# ======================================================================
-# FEDERATED LOOP
-# ======================================================================
+# ==============================================================
+# FEDERATED LOOP (HPC-SAFE)
+# ==============================================================
 
 def federated_run(ds_name, gpus):
 
-    # --------------------------------------------------------------
-    # RAW DATA LOADING ONCE
-    # --------------------------------------------------------------
+    # load cached raw data
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
-    labels_np = raw_labels.numpy()
 
-    # --------------------------------------------------------------
-    # TEST SET
-    # --------------------------------------------------------------
+    # test loader
     transform_test = transforms.Compose([
         transforms.Resize(224),
         transforms.ToTensor(),
@@ -306,69 +276,60 @@ def federated_run(ds_name, gpus):
         nc = 10
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
-
-    # ===================================================================
-    # LOOP α VALUES
-    # ===================================================================
+    labels_np = raw_labels.numpy()
 
     for alpha in DIR_ALPHAS:
 
         loga(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
-
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
 
-        # INIT GLOBAL MODEL
         device0 = "cuda:0"
         global_model = ResNet18Pre(nc).to(device0)
-        ema_model = ResNet18Pre(nc).to(device0)
-        ema_model.load_state_dict(global_model.state_dict())
-
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
         os.makedirs("global_ckpt", exist_ok=True)
         os.makedirs("client_updates", exist_ok=True)
 
+        global_ckpt_path = "global_ckpt/global_round_0.pth"
+        torch.save(global_model.state_dict(), global_ckpt_path)
+
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
         c_local = [[torch.zeros_like(p).cpu() for p in trainable]
                    for _ in range(NUM_CLIENTS)]
-
-        # COSINE LR schedule
-        def cosine_lr(r):
-            t = r / NUM_ROUNDS
-            return LR_INIT * (0.5 * (1 + np.cos(np.pi * t)))
 
         # ==========================================================
         # ROUNDS
         # ==========================================================
 
-        for rnd in range(1, NUM_ROUNDS+1):
+        for rnd in range(1, NUM_ROUNDS + 1):
 
-            lr = cosine_lr(rnd)
+            lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
 
-            # save control variates
+            # Save control variates
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # save indices
+            # Save train indexes
             idx_paths = []
             for cid in range(NUM_CLIENTS):
-                p = f"global_ckpt/train_idx_{cid}.pth"
-                torch.save(splits[cid], p)
-                idx_paths.append(p)
+                path = f"global_ckpt/train_idx_{cid}.pth"
+                torch.save(splits[cid], path)
+                idx_paths.append(path)
 
-            # save current global model
-            global_ckpt_path = f"global_ckpt/global_{rnd}.pth"
+            # Save global model
+            global_ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
             torch.save(global_model.state_dict(), global_ckpt_path)
 
-            # --------------------------------------------------
-            # WORKERS (silent)
-            # --------------------------------------------------
+            # ---------------------------------------------
+            # Workers — silent mode
+            # ---------------------------------------------
             procs = []
             out_paths = []
 
             for cid in range(NUM_CLIENTS):
-                p_out = f"client_updates/cid_{cid}_r{rnd}.pth"
-                out_paths.append(p_out)
+                gpu = cid % gpus
+                outp = f"client_updates/cid_{cid}_r{rnd}.pth"
+                out_paths.append(outp)
 
                 cmd = [
                     sys.executable, "main.py",
@@ -376,12 +337,12 @@ def federated_run(ds_name, gpus):
                     "--dataset", ds_name,
                     "--num_classes", str(nc),
                     "--cid", str(cid),
-                    "--gpu", str(cid % gpus),
+                    "--gpu", str(gpu),
                     "--global_ckpt", global_ckpt_path,
                     "--state_c", state_c_path,
                     "--train_idx", idx_paths[cid],
                     "--lr", str(lr),
-                    "--output", p_out,
+                    "--output", outp
                 ]
 
                 procs.append(subprocess.Popen(
@@ -390,22 +351,26 @@ def federated_run(ds_name, gpus):
                     stderr=subprocess.DEVNULL
                 ))
 
+            # wait all workers
             for p in procs:
                 p.wait()
 
-            # --------------------------------------------------
-            # HPC-SAFE FILE CHECK + RETRY LOGIC
-            # --------------------------------------------------
-            for cid, outp in enumerate(out_paths):
+            # ---------------------------------------------
+            # HPC-SAFE FILE LOADING (retry logic)
+            # ---------------------------------------------
+            updates = []
 
-                if not os.path.exists(outp):
-                    waited = 0
-                    while not os.path.exists(outp) and waited < 40:
-                        time.sleep(1)
-                        waited += 1
+            for cid in range(NUM_CLIENTS):
+                outp = out_paths[cid]
 
+                # wait until file appears
+                wait_time = 0
+                while not os.path.exists(outp) and wait_time < 30:
+                    time.sleep(1)
+                    wait_time += 1
+
+                # relaunch worker once if still missing
                 if not os.path.exists(outp):
-                    # retry worker once
                     cmd = [
                         sys.executable, "main.py",
                         "--worker",
@@ -417,56 +382,55 @@ def federated_run(ds_name, gpus):
                         "--state_c", state_c_path,
                         "--train_idx", idx_paths[cid],
                         "--lr", str(lr),
-                        "--output", outp,
+                        "--output", outp
                     ]
                     subprocess.Popen(
                         cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     ).wait()
 
+                    wait_time = 0
+                    while not os.path.exists(outp) and wait_time < 30:
+                        time.sleep(1)
+                        wait_time += 1
+
                 if not os.path.exists(outp):
                     raise RuntimeError(f"Worker {cid} FAILED twice: {outp}")
 
-            # --------------------------------------------------
-            # LOAD UPDATES
-            # --------------------------------------------------
-            updates = [torch.load(out_paths[c], map_location="cpu")
-                       for c in range(NUM_CLIENTS)]
+                updates.append(torch.load(outp, map_location="cpu"))
 
-            new_accum = [torch.zeros_like(p) for p in updates[0]["new_params"]]
-
+            # ---------------------------------------------
+            # AGGREGATION
+            # ---------------------------------------------
+            new_accum = None
             for u in updates:
+                if new_accum is None:
+                    new_accum = [torch.zeros_like(p) for p in u["new_params"]]
                 for i, p in enumerate(u["new_params"]):
                     new_accum[i] += p
 
             avg_params = [p / NUM_CLIENTS for p in new_accum]
 
-            # update global
-            idx = 0
+            idx_p = 0
             with torch.no_grad():
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[idx].to(device0))
-                        idx += 1
+                        p.copy_(avg_params[idx_p].to(device0))
+                        idx_p += 1
 
-            # update c_global
+            # update variates
             for i in range(len(c_global)):
                 c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
-            # update local
             for u in updates:
                 c_local[u["cid"]] = u["new_c_local"]
 
-            # EMA Model Update (improves final acc by +1%)
-            ema_update(global_model, ema_model)
-
-            # Evaluation (use ema_model for smoother accuracy)
-            acc = evaluate(ema_model, testloader, device0)
+            # EVAL
+            acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-
-# ======================================================================
+# ==============================================================
 # MAIN
-# ======================================================================
+# ==============================================================
 
 def main():
     parser = argparse.ArgumentParser()
@@ -489,9 +453,8 @@ def main():
 
     set_seed(SEED)
 
-    # only CIFAR10 for now
-    federated_run("CIFAR10", args.gpus)
-
+    for ds in ["CIFAR10"]:
+        federated_run(ds, args.gpus)
 
 if __name__ == "__main__":
     main()
