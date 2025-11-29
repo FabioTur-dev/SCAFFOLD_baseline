@@ -2,63 +2,68 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import os
+import subprocess
+import sys
+import time
 import random
 import numpy as np
-import sys
-import io
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.multiprocessing as mp
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms, models
 
 
-# ============================================================
-# LOGGING
-# ============================================================
+# ======================================================================
+# LOGGING (DEBUG→stderr, ACCURACY→stdout)
+# ======================================================================
 
 DEBUG = True
 
-def log_debug(msg):
+def logd(msg):
     if DEBUG:
         print(msg, file=sys.stderr, flush=True)
 
-def log_accuracy(msg):
+def loga(msg):
     print(msg, file=sys.stdout, flush=True)
 
 
-# ============================================================
+# ======================================================================
 # CONFIG
-# ============================================================
+# ======================================================================
 
 NUM_CLIENTS = 10
-DIRICHLET_ALPHAS = [0.5, 0.1, 0.05]
+DIR_ALPHAS = [0.5, 0.1, 0.05]
 NUM_ROUNDS = 100
 LOCAL_EPOCHS = 2
-BATCH_SIZE = 64
-LR_INIT = 0.01
-LR_DECAY_ROUND = 50
+BATCH = 64
+LR0 = 0.01
+LR_DECAY = 50
 BETA = 0.01
 SEED = 42
 
 
-# ============================================================
-# UTILS
-# ============================================================
+# ======================================================================
+# SEED
+# ======================================================================
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def set_seed(s):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(s)
 
+
+# ======================================================================
+# DIRICHLET SPLIT
+# ======================================================================
 
 def dirichlet_split(labels, n_clients, alpha):
     labels = np.array(labels)
-    per_client = [[] for _ in range(n_clients)]
+    per = [[] for _ in range(n_clients)]
     classes = np.unique(labels)
 
     for c in classes:
@@ -68,73 +73,129 @@ def dirichlet_split(labels, n_clients, alpha):
         cuts = (np.cumsum(p) * len(idx)).astype(int)
         chunks = np.split(idx, cuts[:-1])
         for i in range(n_clients):
-            per_client[i].extend(chunks[i])
-
-    for c in per_client:
+            per[i].extend(chunks[i])
+    for c in per:
         random.shuffle(c)
+    return per
 
-    return per_client
 
+# ======================================================================
+# MODEL DEF
+# ======================================================================
 
-# ============================================================
-# MODEL
-# ============================================================
-
-class ResNet18_Pretrained(nn.Module):
-    def __init__(self, num_classes):
+class ResNet18Pre(nn.Module):
+    def __init__(self, nc):
         super().__init__()
         try:
             from torchvision.models import ResNet18_Weights
-            self.model = models.resnet18(
-                weights=ResNet18_Weights.IMAGENET1K_V1
-            )
-        except Exception:
-            self.model = models.resnet18(pretrained=True)
-
-        in_f = self.model.fc.in_features
-        self.model.fc = nn.Linear(in_f, num_classes)
-
-        for p in self.model.parameters():
+            self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        except:
+            self.m = models.resnet18(pretrained=True)
+        in_f = self.m.fc.in_features
+        self.m.fc = nn.Linear(in_f, nc)
+        for p in self.m.parameters():
             p.requires_grad = True
 
     def forward(self, x):
-        return self.model(x)
+        return self.m(x)
 
 
-# ============================================================
-# SERIALIZATION HELPERS
-# ============================================================
+# ======================================================================
+# DATASET
+# ======================================================================
 
-def tensorlist_to_bytes(params):
-    """Serialize list of CPU tensors into bytes."""
-    buffer = io.BytesIO()
-    torch.save(params, buffer)
-    return buffer.getvalue()
+def load_dataset(name):
+    if name == "CIFAR10":
+        nc = 10
+        Ttr = transforms.Compose([
+            transforms.Resize(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(224, padding=16),
+            transforms.ToTensor(),
+        ])
+        Tte = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+        ])
+        tr = datasets.CIFAR10("./data", train=True, download=True, transform=Ttr)
+        te = datasets.CIFAR10("./data", train=False, download=True, transform=Tte)
+        labels = tr.targets
+
+    elif name == "CIFAR100":
+        nc = 100
+        Ttr = transforms.Compose([
+            transforms.Resize(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(224, padding=16),
+            transforms.ToTensor(),
+        ])
+        Tte = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+        ])
+        tr = datasets.CIFAR100("./data", train=True, download=True, transform=Ttr)
+        te = datasets.CIFAR100("./data", train=False, download=True, transform=Tte)
+        labels = tr.targets
+
+    else:  # SVHN
+        nc = 10
+        Ttr = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+        ])
+        Tte = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+        ])
+        tr = datasets.SVHN("./data", split="train", download=True, transform=Ttr)
+        te = datasets.SVHN("./data", split="test", download=True, transform=Tte)
+        labels = tr.labels
+
+    return tr, te, labels, nc
 
 
-def bytes_to_tensorlist(b):
-    """Deserialize bytes back into list of tensors."""
-    buffer = io.BytesIO(b)
-    params = torch.load(buffer)
-    return params
+# ======================================================================
+# CLIENT UPDATE (called ONLY when --worker)
+# ======================================================================
 
+def client_update_worker(args):
+    """
+    This is executed when main.py is called with --worker.
+    """
 
-# ============================================================
-# CLIENT UPDATE
-# ============================================================
+    device = f"cuda:{args.gpu}"
+    logd(f"[WORKER] Running client {args.cid} on {device}")
 
-def client_update(model, device, train_idx, trainset,
-                  c_local, c_global, lr):
+    # Load dataset
+    tr, _, labels, nc = load_dataset(args.dataset)
+
+    # Load model
+    model = ResNet18Pre(nc).to(device)
+
+    # Load global weights
+    global_sd = torch.load(args.global_ckpt, map_location="cpu")
+    model.load_state_dict(global_sd)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
+
+    # Load c_local, c_global
+    state = torch.load(args.state_c, map_location="cpu")
+    c_local = state["c_local"]
+    c_global = state["c_global"]
+
+    # Indices of this client
+    train_idx = torch.load(args.train_idx)
+
+    # Client update
     old_params = [p.detach().clone().cpu() for p in trainable]
 
-    loader = DataLoader(
-        Subset(trainset, train_idx),
-        batch_size=BATCH_SIZE,
+    loader = torch.utils.data.DataLoader(
+        Subset(tr, train_idx),
+        batch_size=BATCH,
         shuffle=True
     )
 
+    lr = args.lr
     opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
     E = len(loader)
 
@@ -158,122 +219,164 @@ def client_update(model, device, train_idx, trainset,
         delta_c.append(dc)
         c_local[i] += dc
 
-    return new_params, c_local, delta_c
+    # Save results
+    torch.save({
+        "cid": args.cid,
+        "new_params": new_params,
+        "new_c_local": c_local,
+        "delta_c": delta_c,
+    }, args.output)
+
+    logd(f"[WORKER] Client {args.cid} finished")
+    return
 
 
-# ============================================================
-# WORKER LOOP (spawned)
-# ============================================================
+# ======================================================================
+# MAIN FEDERATED LOOP
+# ======================================================================
 
-def worker_loop(gpu_id, pipe, trainset, num_classes):
+def federated_run(dataset_name, gpus):
 
-    torch.cuda.set_device(gpu_id)
-    device = f"cuda:{gpu_id}"
+    print(f"\n========== DATASET: {dataset_name} ==========\n", flush=True)
 
-    log_debug(f"[WORKER {gpu_id}] Started on {device}")
+    tr, te, labels, nc = load_dataset(dataset_name)
+    testloader = DataLoader(te, batch_size=256, shuffle=False)
 
-    model = ResNet18_Pretrained(num_classes).to(device)
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    splits = {}
 
-    while True:
-        msg = pipe.recv()
+    for alpha in DIR_ALPHAS:
 
-        if msg[0] == "STOP":
-            log_debug(f"[WORKER {gpu_id}] Stopping.")
-            return
+        print(f"\n==== α = {alpha} ====\n", flush=True)
 
-        if msg[0] == "SET_GLOBAL":
-            # receive whole model as bytes
-            byte_blob = pipe.recv()
-            param_list = bytes_to_tensorlist(byte_blob)
-            for p, newp in zip(trainable, param_list):
-                p.data.copy_(newp.to(device))
-            pipe.send("OK_SET")
-            continue
+        splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
-        if msg[0] == "RUN":
-            _, cid, train_idx, c_local, c_global, lr = msg
+        # Prepare directories
+        os.makedirs("global_ckpt", exist_ok=True)
+        os.makedirs("client_updates", exist_ok=True)
 
-            new_params, new_c_local, delta_c = client_update(
-                model, device, train_idx,
-                trainset,
-                c_local,
-                c_global,
-                lr
-            )
+        # Initialize global model
+        device0 = "cuda:0"
+        global_model = ResNet18Pre(nc).to(device0)
 
-            pipe.send((cid, new_params, new_c_local, delta_c))
+        ckpt_path = "global_ckpt/global_round_0.pth"
+        torch.save(global_model.state_dict(), ckpt_path)
+
+        # Scaffold buffers
+        trainable = [p for p in global_model.parameters() if p.requires_grad]
+        c_global = [torch.zeros_like(p).cpu() for p in trainable]
+        c_local = [[torch.zeros_like(p).cpu() for p in trainable]
+                   for _ in range(NUM_CLIENTS)]
+
+        # Round loop
+        for rnd in range(1, NUM_ROUNDS + 1):
+
+            lr = LR0 if rnd <= LR_DECAY else LR0 * 0.1
+            print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
+
+            # Broadcast c_local / c_global for all clients
+            state_c_path = "global_ckpt/state_c.pth"
+            torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
+
+            # Broadcast train indices
+            idx_paths = []
+            for cid in range(NUM_CLIENTS):
+                p = f"global_ckpt/train_idx_{cid}.pth"
+                torch.save(splits[cid], p)
+                idx_paths.append(p)
+
+            # Re-save global model (fresh)
+            ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
+            torch.save(global_model.state_dict(), ckpt_path)
+
+            # ---------------------------------------------
+            # Launch clients as subprocesses
+            # ---------------------------------------------
+            procs = []
+            out_paths = []
+            for cid in range(NUM_CLIENTS):
+                gpu = cid % gpus
+                outp = f"client_updates/cid_{cid}_r{rnd}.pth"
+                out_paths.append(outp)
+
+                cmd = [
+                    sys.executable,
+                    "main.py",
+                    "--worker",
+                    "--dataset", dataset_name,
+                    "--cid", str(cid),
+                    "--gpu", str(gpu),
+                    "--global_ckpt", ckpt_path,
+                    "--state_c", state_c_path,
+                    "--train_idx", idx_paths[cid],
+                    "--lr", str(lr),
+                    "--output", outp
+                ]
+
+                procs.append(subprocess.Popen(cmd))
+
+            # Wait for all
+            for p in procs:
+                p.wait()
+
+            # ---------------------------------------------
+            # Aggregate
+            # ---------------------------------------------
+            updates = []
+            for cid in range(NUM_CLIENTS):
+                upd = torch.load(out_paths[cid], map_location="cpu")
+                updates.append(upd)
+
+            # Aggregate parameters
+            trainable = [p for p in global_model.parameters() if p.requires_grad]
+
+            new_params_acc = None
+            for upd in updates:
+                if new_params_acc is None:
+                    new_params_acc = [
+                        torch.zeros_like(p) for p in upd["new_params"]
+                    ]
+                for i, p in enumerate(upd["new_params"]):
+                    new_params_acc[i] += p
+
+            avg_params = [x / NUM_CLIENTS for x in new_params_acc]
+
+            # Load averaged weights
+            idx = 0
+            with torch.no_grad():
+                for p in global_model.parameters():
+                    if p.requires_grad:
+                        p.copy_(avg_params[idx].to(device0))
+                        idx += 1
+
+            # Update c_global
+            for i in range(len(c_global)):
+                c_global[i] = torch.zeros_like(c_global[i])
+                for upd in updates:
+                    c_global[i] += upd["delta_c"][i] / NUM_CLIENTS
+
+            # Update c_local
+            for upd in updates:
+                cid = upd["cid"]
+                c_local[cid] = upd["new_c_local"]
+
+            # Save new global model
+            ckpt_path = f"global_ckpt/global_round_{rnd}.pth"
+            torch.save(global_model.state_dict(), ckpt_path)
+
+            # Eval
+            acc = evaluate(global_model, testloader, device0)
+            loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
+
+    return
 
 
-# ============================================================
-# DATASET LOADING
-# ============================================================
-
-def load_dataset(name):
-
-    if name == "CIFAR10":
-        num_classes = 10
-        transform_train = transforms.Compose([
-            transforms.Resize(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(224, padding=16),
-            transforms.ToTensor(),
-        ])
-        transform_test = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
-        train = datasets.CIFAR10("./data", train=True, download=True,
-                                 transform=transform_train)
-        test = datasets.CIFAR10("./data", train=False, download=True,
-                                transform=transform_test)
-        labels = train.targets
-
-    elif name == "CIFAR100":
-        num_classes = 100
-        transform_train = transforms.Compose([
-            transforms.Resize(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(224, padding=16),
-            transforms.ToTensor(),
-        ])
-        transform_test = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
-        train = datasets.CIFAR100("./data", train=True, download=True,
-                                  transform=transform_train)
-        test = datasets.CIFAR100("./data", train=False, download=True,
-                                 transform=transform_test)
-        labels = train.targets
-
-    else:
-        num_classes = 10
-        transform_train = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
-        transform_test = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-        ])
-        train = datasets.SVHN("./data", split="train", download=True,
-                              transform=transform_train)
-        test = datasets.SVHN("./data", split="test", download=True,
-                             transform=transform_test)
-        labels = train.labels
-
-    return train, test, labels, num_classes
-
-
-# ============================================================
+# ======================================================================
 # EVAL
-# ============================================================
+# ======================================================================
 
 def evaluate(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
+    correct = total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -283,148 +386,31 @@ def evaluate(model, loader, device):
     return correct / total
 
 
-# ============================================================
-# FEDERATED
-# ============================================================
-
-def federated_run(dataset_name, gpus):
-
-    print(f"\n========== DATASET: {dataset_name} ==========\n", flush=True)
-
-    trainset, testset, labels, num_classes = load_dataset(dataset_name)
-    testloader = DataLoader(testset, batch_size=256, shuffle=False)
-
-    for alpha in DIRICHLET_ALPHAS:
-
-        print(f"\n==== α = {alpha} ====\n", flush=True)
-
-        splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
-
-        device0 = "cuda:0"
-        global_model = ResNet18_Pretrained(num_classes).to(device0)
-        trainable_params = [p for p in global_model.parameters() if p.requires_grad]
-
-        c_global = [torch.zeros_like(p).cpu() for p in trainable_params]
-        c_local = [[torch.zeros_like(p).cpu() for p in trainable_params]
-                   for _ in range(NUM_CLIENTS)]
-
-        # =====================================================
-        # SPAWN WORKERS + PIPE
-        # =====================================================
-        ctx = mp.get_context("spawn")
-        workers = []
-        pipes = []
-
-        for gpu in range(gpus):
-            parent_conn, child_conn = ctx.Pipe()
-            p = ctx.Process(
-                target=worker_loop,
-                args=(gpu, child_conn, trainset, num_classes)
-            )
-            p.start()
-            workers.append(p)
-            pipes.append(parent_conn)
-
-        # =====================================================
-        # RUN ROUNDS
-        # =====================================================
-        for rnd in range(1, NUM_ROUNDS + 1):
-
-            lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
-            print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
-
-            # -------------------------------------------------
-            # BROADCAST GLOBAL MODEL (FULL)
-            # -------------------------------------------------
-            param_list = [p.detach().cpu() for p in trainable_params]
-            byte_blob = tensorlist_to_bytes(param_list)
-
-            for pipe in pipes:
-                pipe.send(("SET_GLOBAL",))
-                pipe.send(byte_blob)
-
-            for pipe in pipes:
-                ok = pipe.recv()   # wait confirmation
-
-            # -------------------------------------------------
-            # CLIENT JOBS
-            # -------------------------------------------------
-            # round robin assignment
-            for cid in range(NUM_CLIENTS):
-                gpu = cid % gpus
-                pipes[gpu].send((
-                    "RUN",
-                    cid,
-                    splits[cid],
-                    c_local[cid],
-                    c_global,
-                    lr
-                ))
-
-            # -------------------------------------------------
-            # COLLECT RESULTS
-            # -------------------------------------------------
-            new_params_accum = None
-
-            for _ in range(NUM_CLIENTS):
-                # receive from ANY pipe non-blocking round robin
-                got = False
-                while not got:
-                    for pipe in pipes:
-                        if pipe.poll():
-                            cid, new_params, new_c_local, delta_c = pipe.recv()
-                            got = True
-                            break
-
-                c_local[cid] = new_c_local
-
-                if new_params_accum is None:
-                    new_params_accum = [torch.zeros_like(p) for p in new_params]
-
-                for i in range(len(new_params)):
-                    new_params_accum[i] += new_params[i]
-
-                for i in range(len(c_global)):
-                    c_global[i] += delta_c[i] / NUM_CLIENTS
-
-            # -------------------------------------------------
-            # UPDATE GLOBAL MODEL
-            # -------------------------------------------------
-            avg_params = [p / NUM_CLIENTS for p in new_params_accum]
-
-            idx = 0
-            with torch.no_grad():
-                for p in trainable_params:
-                    p.copy_(avg_params[idx].to(device0))
-                    idx += 1
-
-            # -------------------------------------------------
-            # EVAL
-            # -------------------------------------------------
-            acc = evaluate(global_model, testloader, device0)
-            log_accuracy(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
-
-        # =====================================================
-        # SHUTDOWN WORKERS
-        # =====================================================
-        for pipe in pipes:
-            pipe.send(("STOP",))
-        for p in workers:
-            p.join()
-
-
-# ============================================================
-# MAIN
-# ============================================================
+# ======================================================================
+# MAIN ENTRY
+# ======================================================================
 
 def main():
-    set_seed(SEED)
-
-    mp.set_start_method("spawn", force=True)
-
     parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--cid", type=int)
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--global_ckpt", type=str)
+    parser.add_argument("--state_c", type=str)
+    parser.add_argument("--train_idx", type=str)
+    parser.add_argument("--output", type=str)
+    parser.add_argument("--lr", type=float)
     parser.add_argument("--gpus", type=int, default=1)
+
     args = parser.parse_args()
+
+    # WORKER MODE
+    if args.worker:
+        return client_update_worker(args)
+
+    # MAIN (SERVER) MODE
+    set_seed(SEED)
 
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
         federated_run(ds, args.gpus)
