@@ -17,7 +17,7 @@ from torchvision import datasets, transforms, models
 
 
 # ======================================================================
-# LOGGING (DEBUG→stderr, ACCURACY→stdout)
+# LOGGING (DEBUG → stderr, ACCURACY → stdout)
 # ======================================================================
 
 DEBUG = True
@@ -46,7 +46,7 @@ SEED = 42
 
 
 # ======================================================================
-# SEED
+# SET SEED
 # ======================================================================
 
 def set_seed(s):
@@ -80,7 +80,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================================
-# MODEL DEF
+# MODEL
 # ======================================================================
 
 class ResNet18Pre(nn.Module):
@@ -155,7 +155,7 @@ def load_dataset(name):
 
 
 # ======================================================================
-# CLIENT UPDATE (called ONLY when --worker)
+# CLIENT UPDATE (executed only when --worker)
 # ======================================================================
 
 def client_update_worker(args):
@@ -178,12 +178,14 @@ def client_update_worker(args):
 
     trainable = [p for p in model.parameters() if p.requires_grad]
 
-    # Load c_local, c_global
+    # Load c_local and c_global
     state = torch.load(args.state_c, map_location="cpu")
-    c_local = state["c_local"]
-    c_global = state["c_global"]
 
-    # Indices of this client
+    # FIX: Load ONLY this client's c_local
+    c_global = state["c_global"]                     # list of tensors
+    c_local = state["c_local"][args.cid]             # list of tensors FOR THIS CLIENT
+
+    # Load training indices
     train_idx = torch.load(args.train_idx)
 
     # Client update
@@ -199,19 +201,21 @@ def client_update_worker(args):
     opt = optim.SGD(trainable, lr=lr, momentum=0.9, weight_decay=5e-4)
     E = len(loader)
 
-    for ep in range(LOCAL_EPOCHS):
+    for _ in range(LOCAL_EPOCHS):
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
             out = model(x)
             loss = nn.CrossEntropyLoss()(out, y)
             loss.backward()
+            # SCAFFOLD correction
             for i, p in enumerate(trainable):
                 p.grad += (c_global[i].to(device) - c_local[i].to(device))
             opt.step()
 
     new_params = [p.detach().clone().cpu() for p in trainable]
 
+    # Update c_local and compute delta_c
     delta_c = []
     for i in range(len(new_params)):
         diff = new_params[i] - old_params[i]
@@ -232,7 +236,23 @@ def client_update_worker(args):
 
 
 # ======================================================================
-# MAIN FEDERATED LOOP
+# EVALUATION
+# ======================================================================
+
+def evaluate(model, loader, device):
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return correct / total
+
+
+# ======================================================================
+# FEDERATED SERVER LOOP
 # ======================================================================
 
 def federated_run(dataset_name, gpus):
@@ -241,8 +261,6 @@ def federated_run(dataset_name, gpus):
 
     tr, te, labels, nc = load_dataset(dataset_name)
     testloader = DataLoader(te, batch_size=256, shuffle=False)
-
-    splits = {}
 
     for alpha in DIR_ALPHAS:
 
@@ -261,7 +279,7 @@ def federated_run(dataset_name, gpus):
         ckpt_path = "global_ckpt/global_round_0.pth"
         torch.save(global_model.state_dict(), ckpt_path)
 
-        # Scaffold buffers
+        # SCAFFOLD buffers
         trainable = [p for p in global_model.parameters() if p.requires_grad]
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
         c_local = [[torch.zeros_like(p).cpu() for p in trainable]
@@ -273,11 +291,11 @@ def federated_run(dataset_name, gpus):
             lr = LR0 if rnd <= LR_DECAY else LR0 * 0.1
             print(f"--- ROUND {rnd}/{NUM_ROUNDS} ---", flush=True)
 
-            # Broadcast c_local / c_global for all clients
+            # Save correction state
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # Broadcast train indices
+            # Save indices
             idx_paths = []
             for cid in range(NUM_CLIENTS):
                 p = f"global_ckpt/train_idx_{cid}.pth"
@@ -288,9 +306,9 @@ def federated_run(dataset_name, gpus):
             ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
             torch.save(global_model.state_dict(), ckpt_path)
 
-            # ---------------------------------------------
+            # ---------------------------
             # Launch clients as subprocesses
-            # ---------------------------------------------
+            # ---------------------------
             procs = []
             out_paths = []
             for cid in range(NUM_CLIENTS):
@@ -314,21 +332,19 @@ def federated_run(dataset_name, gpus):
 
                 procs.append(subprocess.Popen(cmd))
 
-            # Wait for all
+            # Wait for all processes
             for p in procs:
                 p.wait()
 
-            # ---------------------------------------------
+            # ---------------------------
             # Aggregate
-            # ---------------------------------------------
+            # ---------------------------
             updates = []
             for cid in range(NUM_CLIENTS):
                 upd = torch.load(out_paths[cid], map_location="cpu")
                 updates.append(upd)
 
             # Aggregate parameters
-            trainable = [p for p in global_model.parameters() if p.requires_grad]
-
             new_params_acc = None
             for upd in updates:
                 if new_params_acc is None:
@@ -348,18 +364,18 @@ def federated_run(dataset_name, gpus):
                         p.copy_(avg_params[idx].to(device0))
                         idx += 1
 
-            # Update c_global
+            # Update global control variate c_global
             for i in range(len(c_global)):
                 c_global[i] = torch.zeros_like(c_global[i])
                 for upd in updates:
                     c_global[i] += upd["delta_c"][i] / NUM_CLIENTS
 
-            # Update c_local
+            # Update local control variates
             for upd in updates:
                 cid = upd["cid"]
                 c_local[cid] = upd["new_c_local"]
 
-            # Save new global model
+            # Save updated global model
             ckpt_path = f"global_ckpt/global_round_{rnd}.pth"
             torch.save(global_model.state_dict(), ckpt_path)
 
@@ -367,27 +383,9 @@ def federated_run(dataset_name, gpus):
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-    return
-
 
 # ======================================================================
-# EVAL
-# ======================================================================
-
-def evaluate(model, loader, device):
-    model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            pred = model(x).argmax(1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-    return correct / total
-
-
-# ======================================================================
-# MAIN ENTRY
+# MAIN ENTRY POINT
 # ======================================================================
 
 def main():
@@ -405,11 +403,11 @@ def main():
 
     args = parser.parse_args()
 
-    # WORKER MODE
+    # Worker mode
     if args.worker:
         return client_update_worker(args)
 
-    # MAIN (SERVER) MODE
+    # Server main
     set_seed(SEED)
 
     for ds in ["CIFAR10", "CIFAR100", "SVHN"]:
