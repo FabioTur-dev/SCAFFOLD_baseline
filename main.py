@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse
-import os
-import sys
 import random
 import numpy as np
-import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,27 +11,24 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
 from torchvision.transforms.functional import to_pil_image
 
-
 # ==============================================================
-# CONFIG – Sequential SCAFFOLD (target ~85% on CIFAR10)
+# CONFIG – Sequential SCAFFOLD (più stabile, target alto)
 # ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5]   # puoi aggiungere altri alpha se vuoi
+DIR_ALPHAS = [0.5]
 NUM_ROUNDS = 50
-LOCAL_EPOCHS = 3
+LOCAL_EPOCHS = 2
 BATCH = 128
 
-# LR un po' più aggressiva, decay dopo 30 round
-LR_INIT = 0.006
-LR_DECAY_ROUND = 30
-LR_DECAY = 0.002
+LR_INIT = 0.0045
+LR_DECAY_ROUND = 20
+LR_DECAY = 0.0015
 
-BETA = 0.01
-DAMPING = 0.05        # leggermente ridotto per stabilità con più capacità
+BETA = 0.005       # più conservativo
+DAMPING = 0.075    # un po' meno aggressivo di 0.1
 GRAD_CLIP = 5.0
 SEED = 42
-
 
 # ==============================================================
 
@@ -46,13 +39,11 @@ def set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
-
 def log(msg):
     print(msg, flush=True)
 
-
 # ==============================================================
-# DATASET WRAPPER – Resize 160 + augment un po' più ricco
+# DATASET WRAPPER – Resize 160
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -70,7 +61,7 @@ class RawDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
-                transforms.RandomErasing(p=0.3, scale=(0.02, 0.2)),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
@@ -88,7 +79,6 @@ class RawDataset(Dataset):
 
     def __len__(self):
         return len(self.indices)
-
 
 # ==============================================================
 # DIRICHLET SPLIT
@@ -109,9 +99,7 @@ def dirichlet_split(labels, n_clients, alpha):
             per[i].extend(chunks[i])
     for cl in per:
         random.shuffle(cl)
-
     return per
-
 
 # ==============================================================
 # MODEL – RESNET18 (layer2 + layer3 + layer4 + fc sbloccati)
@@ -129,7 +117,6 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # 🔓 layer2/3/4 + fc allenabili, il resto frozen
         for name, p in self.m.named_parameters():
             if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -138,7 +125,6 @@ class ResNet18Pre(nn.Module):
 
     def forward(self, x):
         return self.m(x)
-
 
 # ==============================================================
 # LOCAL TRAINING (SCAFFOLD CLIENT)
@@ -165,14 +151,12 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
-            # SCAFFOLD correction
             for i, p in enumerate(trainable):
                 p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
 
-    # Compute scaffold deltas
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
 
@@ -183,7 +167,6 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
         c_local[i] += dc
 
     return new_params, delta_c, c_local
-
 
 # ==============================================================
 # GLOBAL EVAL
@@ -201,7 +184,6 @@ def evaluate(model, loader, device):
             tot += y.size(0)
     return c / tot
 
-
 # ==============================================================
 # FEDERATED LOOP (SEQUENTIAL SCAFFOLD)
 # ==============================================================
@@ -210,16 +192,14 @@ def federated_run(ds_name):
 
     device = "cuda:0"
 
-    # Load raw data once
     if ds_name == "CIFAR10":
         tr = datasets.CIFAR10("./data", train=True, download=True)
         data = torch.tensor(tr.data).permute(0, 3, 1, 2)
         labels = torch.tensor(tr.targets)
         nc = 10
     else:
-        raise ValueError("Only CIFAR10 implemented in this version")
+        raise ValueError("Only CIFAR10 implemented")
 
-    # Test loader (stesso resize di train, ma senza augment)
     transform_test = transforms.Compose([
         transforms.Resize(160),
         transforms.ToTensor(),
@@ -237,23 +217,19 @@ def federated_run(ds_name):
 
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
 
-        # Global model
         global_model = ResNet18Pre(nc).to(device)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
-        # SCAFFOLD control variates
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
         c_locals = [
             [torch.zeros_like(p).cpu() for p in trainable]
             for _ in range(NUM_CLIENTS)
         ]
 
-        # Sequential FL rounds
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
 
-            # Freeza i pesi globali di inizio round per TUTTI i client
             global_start = [p.detach().clone().cpu() for p in trainable]
 
             new_params_all = []
@@ -261,7 +237,6 @@ def federated_run(ds_name):
 
             for cid in range(NUM_CLIENTS):
 
-                # Local model parte dallo STESSO global_start (verissimo FL)
                 local_model = ResNet18Pre(nc).to(device)
 
                 with torch.no_grad():
@@ -271,7 +246,6 @@ def federated_run(ds_name):
                             p.copy_(global_start[idx].to(device))
                             idx += 1
 
-                # Local SCAFFOLD update
                 new_params, delta_c, new_c_local = run_client(
                     local_model,
                     splits[cid],
@@ -285,7 +259,6 @@ def federated_run(ds_name):
                 new_params_all.append(new_params)
                 delta_c_all.append(delta_c)
 
-            # Aggregazione parametri
             avg_params = []
             for i in range(len(trainable)):
                 stacked = torch.stack([client_params[i] for client_params in new_params_all], dim=0)
@@ -298,15 +271,12 @@ def federated_run(ds_name):
                         p.copy_(avg_params[idx].to(device))
                         idx += 1
 
-            # Update c_global
             for i in range(len(c_global)):
                 stacked = torch.stack([dc[i] for dc in delta_c_all], dim=0)
                 c_global[i] = stacked.mean(0)
 
-            # Eval globale
             acc = evaluate(global_model, testloader, device)
             log(f"[ROUND {rnd}] ACC={acc*100:.2f}%")
-
 
 # ==============================================================
 # MAIN
@@ -315,7 +285,6 @@ def federated_run(ds_name):
 def main():
     set_seed(SEED)
     federated_run("CIFAR10")
-
 
 if __name__ == "__main__":
     main()
