@@ -56,7 +56,7 @@ def set_seed(s):
         torch.cuda.manual_seed_all(s)
 
 # ==============================================================
-# RAW DATASET WRAPPER — FIX + Resize(112)
+# RAW DATASET WRAPPER — FIX + Resize(224)
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -69,7 +69,7 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(112),               # 🔥 FIX
+                transforms.Resize(224),          # 🔥 RESOLUTION FIX
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -77,7 +77,7 @@ class RawDataset(Dataset):
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(112),               # 🔥 FIX
+                transforms.Resize(224),          # 🔥 RESOLUTION FIX
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -265,7 +265,7 @@ def federated_run(ds_name, gpus):
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
     transform_test = transforms.Compose([
-        transforms.Resize(112),           # 🔥 FIX
+        transforms.Resize(224),           # 🔥 RESOLUTION FIX
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225)),
