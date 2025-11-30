@@ -18,7 +18,7 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ==============================================================
-# CONFIG (SCAFFOLD-Lite Stable + High Accuracy)
+# CONFIG (SCAFFOLD-Lite, last blocks only, 50 rounds)
 # ==============================================================
 
 NUM_CLIENTS = 10
@@ -27,9 +27,10 @@ NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
 
-LR_INIT = 0.005
-LR_DECAY = 0.0015
-DECAY_ROUND = 20
+# LR pensata per arrivare alto entro 50 round
+LR_INIT = 0.0035
+LR_DECAY = 0.0010
+DECAY_ROUND = 25
 
 BETA = 0.01
 DAMPING = 0.1
@@ -61,7 +62,7 @@ def set_seed(s):
 
 
 # ==============================================================
-# DATASET WRAPPER — Resize 192 + balanced augment
+# DATASET WRAPPER — Resize 160 + augment “classico”
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -75,22 +76,21 @@ class RawDataset(Dataset):
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
 
-                transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
-
-                transforms.Resize(192),
+                transforms.Resize(160),
 
                 transforms.ToTensor(),
-                transforms.Normalize((0.485,0.456,0.406),
-                                     (0.229,0.224,0.225)),
+                transforms.Normalize((0.485, 0.456, 0.406),
+                                     (0.229, 0.224, 0.225)),
 
-                transforms.RandomErasing(p=0.35, scale=(0.02, 0.2)),
+                # regolarizzazione moderata (non estrema)
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(192),
+                transforms.Resize(160),
                 transforms.ToTensor(),
-                transforms.Normalize((0.485,0.456,0.406),
-                                     (0.229,0.224,0.225)),
+                transforms.Normalize((0.485, 0.456, 0.406),
+                                     (0.229, 0.224, 0.225)),
             ])
 
     def __len__(self):
@@ -98,8 +98,10 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = to_pil_image(self.data[idx])
-        return self.T(img), self.labels[idx]
+        img = self.data[idx]
+        img = to_pil_image(img)
+        img = self.T(img)
+        return img, self.labels[idx]
 
 
 # ==============================================================
@@ -109,8 +111,9 @@ class RawDataset(Dataset):
 def dirichlet_split(labels, n_clients, alpha):
     labels = np.array(labels)
     per = [[] for _ in range(n_clients)]
+    classes = np.unique(labels)
 
-    for c in np.unique(labels):
+    for c in classes:
         idx = np.where(labels == c)[0]
         np.random.shuffle(idx)
         p = np.random.dirichlet([alpha] * n_clients)
@@ -119,19 +122,19 @@ def dirichlet_split(labels, n_clients, alpha):
         for i in range(n_clients):
             per[i].extend(chunks[i])
 
-    for c in per:
-        random.shuffle(c)
+    for cl in per:
+        random.shuffle(cl)
+
     return per
 
 
 # ==============================================================
-# MODEL — ResNet18 with layer2+3+4+fc unlocked
+# MODEL — ResNet18 con SOLO layer3+layer4+fc sbloccati
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
-
         try:
             from torchvision.models import ResNet18_Weights
             self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
@@ -141,8 +144,9 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # 🔒 layer1 / layer2 congelati, 🔓 layer3 / layer4 / fc
         for name, p in self.m.named_parameters():
-            if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
@@ -152,27 +156,34 @@ class ResNet18Pre(nn.Module):
 
 
 # ==============================================================
-# PREPROCESS
+# PREPROCESS RAW
 # ==============================================================
 
 def preprocess_raw_dataset(ds_name):
     os.makedirs("cached", exist_ok=True)
-    data_path = f"cached/{ds_name}_train_raw.pt"
-    label_path = f"cached/{ds_name}_train_labels.pt"
+    data_file = f"cached/{ds_name}_train_raw.pt"
+    label_file = f"cached/{ds_name}_train_labels.pt"
 
-    if os.path.exists(data_path):
-        return torch.load(data_path), torch.load(label_path)
+    if os.path.exists(data_file) and os.path.exists(label_file):
+        return torch.load(data_file), torch.load(label_file)
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)
+        data = torch.tensor(d.data).permute(0, 3, 1, 2)
         labels = torch.tensor(d.targets)
-
+    elif ds_name == "CIFAR100":
+        d = datasets.CIFAR100("./data", train=True, download=True)
+        data = torch.tensor(d.data).permute(0, 3, 1, 2)
+        labels = torch.tensor(d.targets)
     else:
-        raise ValueError("Only CIFAR10 supported here")
+        from torchvision.datasets import SVHN
+        d = SVHN("./data", split="train", download=True)
+        data = torch.tensor(d.data).permute(0, 3, 1, 2)
+        labels = torch.tensor(d.labels)
 
-    torch.save(data, data_path)
-    torch.save(labels, label_path)
+    torch.save(data, data_file)
+    torch.save(labels, label_file)
+
     return data, labels
 
 
@@ -188,8 +199,11 @@ def client_update_worker(args):
     indices = torch.load(args.train_idx)
 
     ds = RawDataset(data, labels, indices, augment=True)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
-                        num_workers=2, pin_memory=True)
+
+    loader = DataLoader(
+        ds, batch_size=BATCH, shuffle=True,
+        num_workers=2, pin_memory=True
+    )
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
@@ -224,6 +238,7 @@ def client_update_worker(args):
 
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
+
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
         dc = BETA * (diff / max(E, 1))
@@ -244,7 +259,8 @@ def client_update_worker(args):
 
 def evaluate(model, loader, device):
     model.eval()
-    correct, total = 0, 0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -255,7 +271,7 @@ def evaluate(model, loader, device):
 
 
 # ==============================================================
-# FEDERATED LOOP (WITH SYNC FIX)
+# FEDERATED LOOP (con mini keep-alive)
 # ==============================================================
 
 def federated_run(ds_name, gpus):
@@ -263,23 +279,29 @@ def federated_run(ds_name, gpus):
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
     transform_test = transforms.Compose([
-        transforms.Resize(192),
+        transforms.Resize(160),
         transforms.ToTensor(),
-        transforms.Normalize((0.485,0.456,0.406),
-                             (0.229,0.224,0.225)),
+        transforms.Normalize((0.485, 0.456, 0.406),
+                             (0.229, 0.224, 0.225)),
     ])
 
     if ds_name == "CIFAR10":
-        te = datasets.CIFAR10("./data", train=False, download=True,
-                              transform=transform_test)
+        te = datasets.CIFAR10("./data", train=False, download=True, transform=transform_test)
         nc = 10
+    elif ds_name == "CIFAR100":
+        te = datasets.CIFAR100("./data", train=False, download=True, transform=transform_test)
+        nc = 100
     else:
-        raise ValueError("Only CIFAR10 used here")
+        from torchvision.datasets import SVHN
+        te = SVHN("./data", split="test", download=True, transform=transform_test)
+        nc = 10
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
+
     labels_np = raw_labels.numpy()
 
     for alpha in DIR_ALPHAS:
+
         loga(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
 
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
@@ -306,15 +328,11 @@ def federated_run(ds_name, gpus):
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # ------------------------------------------------
-            # 🔐 SYNC FIX: WAIT UNTIL state_c.pth IS FULLY WRITTEN
-            # ------------------------------------------------
-            for _ in range(300):  # max 3s
+            # piccola barriera per evitare file corrotti
+            for _ in range(300):  # max ~3s
                 if os.path.exists(state_c_path) and os.path.getsize(state_c_path) > 1024:
                     break
                 time.sleep(0.01)
-            else:
-                raise RuntimeError("state_c.pth NOT written correctly!")
 
             idx_paths = []
             for cid in range(NUM_CLIENTS):
@@ -350,17 +368,31 @@ def federated_run(ds_name, gpus):
                 p = subprocess.Popen(cmd)
                 procs.append(p)
 
-            for p in procs:
-                p.wait()
+            # 🔸 MINI KEEP-ALIVE: una riga ogni 5s max finché i worker non hanno finito
+            while True:
+                all_done = True
+                for p in procs:
+                    if p.poll() is None:
+                        all_done = False
+                        break
+                if all_done:
+                    break
+                loga(f"[SERVER] Waiting workers at round {rnd}...")
+                time.sleep(5.0)
 
             time.sleep(0.05)
 
-            for f in out_paths:
-                if not os.path.exists(f):
-                    print("❌ Missing worker output:", f)
-                    sys.exit(1)
+            missing = [f for f in out_paths if not os.path.exists(f)]
+            if missing:
+                print("\n❌ ERRORE WORKER: file mancanti:")
+                for m in missing:
+                    print(" -", m)
+                sys.exit(1)
 
-            updates = [torch.load(p, map_location="cpu") for p in out_paths]
+            updates = [
+                torch.load(out_paths[c], map_location="cpu")
+                for c in range(NUM_CLIENTS)
+            ]
 
             new_accum = None
             for u in updates:
