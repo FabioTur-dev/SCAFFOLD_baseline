@@ -8,31 +8,32 @@ import sys
 import random
 import numpy as np
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
-from torchvision.transforms.functional import to_pil_image  # FIX
+from torchvision.transforms.functional import to_pil_image
+
 
 # ==============================================================
-# CONFIG (SCAFFOLD-Lite Stable)
+# CONFIG (SCAFFOLD-Lite Optimized)
 # ==============================================================
 
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5, 0.1, 0.05]
-NUM_ROUNDS = 50
+NUM_ROUNDS = 100
 LOCAL_EPOCHS = 2
 BATCH = 128
 
-LR_INIT = 0.003
-LR_DECAY_ROUND = 15
-
+LR_INIT = 0.003      # cosine schedule
 BETA = 0.01
 DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
+
 
 # ==============================================================
 # LOG
@@ -43,6 +44,7 @@ def loga(msg):
 
 def logd(msg):
     pass
+
 
 # ==============================================================
 # SEED
@@ -55,8 +57,9 @@ def set_seed(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+
 # ==============================================================
-# RAW DATASET WRAPPER — FIX + Resize(160)
+# RAW DATASET WRAPPER — Resize 192 + Augment migliorato
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -69,15 +72,23 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(160),               # 🔥 FIX 160x160
+
+                # 🔥 Miglioria 1: ColorJitter
+                transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+
+                # 🔥 Resize 192
+                transforms.Resize(192),
+
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
-                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2))
+
+                # 🔥 Miglioria 2: RandomErasing più forte
+                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(160),               # 🔥 FIX 160x160
+                transforms.Resize(192),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -88,11 +99,11 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]   # torch uint8 (3,32,32)
-
-        img = to_pil_image(img)  # FIX: convert before transforms
+        img = self.data[idx]
+        img = to_pil_image(img)
         img = self.T(img)
         return img, self.labels[idx]
+
 
 # ==============================================================
 # DIRICHLET SPLIT
@@ -117,8 +128,9 @@ def dirichlet_split(labels, n_clients, alpha):
 
     return per
 
+
 # ==============================================================
-# MODEL
+# MODEL — ResNet18 con layer2+3+4+fc sbloccati
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
@@ -133,8 +145,9 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # 🔥 Miglioria: sbloccare layer2 + layer3 + layer4 + fc
         for name, p in self.m.named_parameters():
-            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+            if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
@@ -142,8 +155,9 @@ class ResNet18Pre(nn.Module):
     def forward(self, x):
         return self.m(x)
 
+
 # ==============================================================
-# PREPROCESS
+# PREPROCESS RAW
 # ==============================================================
 
 def preprocess_raw_dataset(ds_name):
@@ -172,6 +186,7 @@ def preprocess_raw_dataset(ds_name):
     torch.save(labels, label_file)
 
     return data, labels
+
 
 # ==============================================================
 # CLIENT WORKER
@@ -238,6 +253,7 @@ def client_update_worker(args):
         "delta_c": delta_c,
     }, args.output)
 
+
 # ==============================================================
 # EVALUATION
 # ==============================================================
@@ -254,6 +270,7 @@ def evaluate(model, loader, device):
             total += y.size(0)
     return correct / total
 
+
 # ==============================================================
 # FEDERATED LOOP
 # ==============================================================
@@ -263,7 +280,7 @@ def federated_run(ds_name, gpus):
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
     transform_test = transforms.Compose([
-        transforms.Resize(160),           # 🔥 FIX 160x160
+        transforms.Resize(192),
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225)),
@@ -307,7 +324,8 @@ def federated_run(ds_name, gpus):
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
-            lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
+            # 🔥 Cosine learning rate
+            lr = 0.5 * LR_INIT * (1 + math.cos(math.pi * rnd / NUM_ROUNDS))
 
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
@@ -349,7 +367,7 @@ def federated_run(ds_name, gpus):
             for p in procs:
                 p.wait()
 
-            time.sleep(0.08)
+            time.sleep(0.05)
 
             missing = [f for f in out_paths if not os.path.exists(f)]
             if missing:
@@ -392,6 +410,7 @@ def federated_run(ds_name, gpus):
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
+
 # ==============================================================
 # MAIN
 # ==============================================================
@@ -421,6 +440,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
