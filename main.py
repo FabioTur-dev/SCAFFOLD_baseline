@@ -8,7 +8,6 @@ import sys
 import random
 import numpy as np
 import time
-import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,16 +18,19 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ==============================================================
-# CONFIG (SCAFFOLD-Lite Optimized)
+# CONFIG (SCAFFOLD-Lite Stable + High Accuracy)
 # ==============================================================
 
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5, 0.1, 0.05]
-NUM_ROUNDS = 100
+NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
 
-LR_INIT = 0.003      # cosine schedule
+LR_INIT = 0.003
+LR_DECAY = 0.0015     # dopo round 20
+DECAY_ROUND = 20
+
 BETA = 0.01
 DAMPING = 0.1
 GRAD_CLIP = 5.0
@@ -59,7 +61,7 @@ def set_seed(s):
 
 
 # ==============================================================
-# RAW DATASET WRAPPER — Resize 192 + Augment migliorato
+# DATASET WRAPPER — Resize 192 + augment corretto
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -73,18 +75,16 @@ class RawDataset(Dataset):
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
 
-                # 🔥 Miglioria 1: ColorJitter
-                transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+                # 🔧 Augment corretto
+                transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
 
-                # 🔥 Resize 192
                 transforms.Resize(192),
 
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
 
-                # 🔥 Miglioria 2: RandomErasing più forte
-                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
+                transforms.RandomErasing(p=0.35, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
@@ -145,7 +145,7 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # 🔥 Miglioria: sbloccare layer2 + layer3 + layer4 + fc
+        # 🔧 Sblocco corretto
         for name, p in self.m.named_parameters():
             if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -324,8 +324,8 @@ def federated_run(ds_name, gpus):
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
-            # 🔥 Cosine learning rate
-            lr = 0.5 * LR_INIT * (1 + math.cos(math.pi * rnd / NUM_ROUNDS))
+            # 🔧 LR FIX: fissa i primi 20 round, poi decay
+            lr = LR_INIT if rnd <= DECAY_ROUND else LR_DECAY
 
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
