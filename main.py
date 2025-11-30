@@ -17,21 +17,22 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ==============================================================
-# CONFIG – Sequential SCAFFOLD (REAL & STABLE)
+# CONFIG – Sequential SCAFFOLD (target ~85% on CIFAR10)
 # ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5]
+DIR_ALPHAS = [0.5]   # puoi aggiungere altri alpha se vuoi
 NUM_ROUNDS = 50
-LOCAL_EPOCHS = 2
+LOCAL_EPOCHS = 3
 BATCH = 128
 
-LR_INIT = 0.004
-LR_DECAY_ROUND = 20
-LR_DECAY = 0.0015
+# LR un po' più aggressiva, decay dopo 30 round
+LR_INIT = 0.006
+LR_DECAY_ROUND = 30
+LR_DECAY = 0.002
 
 BETA = 0.01
-DAMPING = 0.1
+DAMPING = 0.05        # leggermente ridotto per stabilità con più capacità
 GRAD_CLIP = 5.0
 SEED = 42
 
@@ -51,7 +52,7 @@ def log(msg):
 
 
 # ==============================================================
-# DATASET WRAPPER
+# DATASET WRAPPER – Resize 160 + augment un po' più ricco
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -64,15 +65,16 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(112),
+                transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
+                transforms.Resize(160),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
-                transforms.RandomErasing(p=0.25)
+                transforms.RandomErasing(p=0.3, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(112),
+                transforms.Resize(160),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -112,7 +114,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ==============================================================
-# MODEL – RESNET18 (layer3 + layer4 + fc sbloccati)
+# MODEL – RESNET18 (layer2 + layer3 + layer4 + fc sbloccati)
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
@@ -127,8 +129,9 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # 🔓 layer2/3/4 + fc allenabili, il resto frozen
         for name, p in self.m.named_parameters():
-            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+            if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
@@ -162,6 +165,7 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
+            # SCAFFOLD correction
             for i, p in enumerate(trainable):
                 p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
@@ -199,7 +203,7 @@ def evaluate(model, loader, device):
 
 
 # ==============================================================
-# FEDERATED LOOP (SEQUENTIAL)
+# FEDERATED LOOP (SEQUENTIAL SCAFFOLD)
 # ==============================================================
 
 def federated_run(ds_name):
@@ -213,11 +217,11 @@ def federated_run(ds_name):
         labels = torch.tensor(tr.targets)
         nc = 10
     else:
-        raise ValueError("Only CIFAR10 implemented in version A")
+        raise ValueError("Only CIFAR10 implemented in this version")
 
-    # Test loader
+    # Test loader (stesso resize di train, ma senza augment)
     transform_test = transforms.Compose([
-        transforms.Resize(112),
+        transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225))
@@ -244,12 +248,12 @@ def federated_run(ds_name):
             for _ in range(NUM_CLIENTS)
         ]
 
-        # Sequential rounds
+        # Sequential FL rounds
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
 
-            # Freeze the starting global weights for all clients this round
+            # Freeza i pesi globali di inizio round per TUTTI i client
             global_start = [p.detach().clone().cpu() for p in trainable]
 
             new_params_all = []
@@ -257,10 +261,9 @@ def federated_run(ds_name):
 
             for cid in range(NUM_CLIENTS):
 
-                # Local model from SAME global start
+                # Local model parte dallo STESSO global_start (verissimo FL)
                 local_model = ResNet18Pre(nc).to(device)
 
-                # load global start weights
                 with torch.no_grad():
                     idx = 0
                     for p in local_model.parameters():
@@ -268,7 +271,7 @@ def federated_run(ds_name):
                             p.copy_(global_start[idx].to(device))
                             idx += 1
 
-                # Train client
+                # Local SCAFFOLD update
                 new_params, delta_c, new_c_local = run_client(
                     local_model,
                     splits[cid],
@@ -282,13 +285,12 @@ def federated_run(ds_name):
                 new_params_all.append(new_params)
                 delta_c_all.append(delta_c)
 
-            # Aggregate params
+            # Aggregazione parametri
             avg_params = []
             for i in range(len(trainable)):
                 stacked = torch.stack([client_params[i] for client_params in new_params_all], dim=0)
                 avg_params.append(stacked.mean(0))
 
-            # Update global model
             with torch.no_grad():
                 idx = 0
                 for p in global_model.parameters():
@@ -301,7 +303,7 @@ def federated_run(ds_name):
                 stacked = torch.stack([dc[i] for dc in delta_c_all], dim=0)
                 c_global[i] = stacked.mean(0)
 
-            # Eval
+            # Eval globale
             acc = evaluate(global_model, testloader, device)
             log(f"[ROUND {rnd}] ACC={acc*100:.2f}%")
 
