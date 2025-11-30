@@ -18,7 +18,7 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ==============================================================
-# CONFIG (SCAFFOLD-Lite, last blocks only, 50 rounds)
+# GLOBAL CONFIG
 # ==============================================================
 
 NUM_CLIENTS = 10
@@ -27,15 +27,8 @@ NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
 
-# LR pensata per arrivare alto entro 50 round
-LR_INIT = 0.0035
-LR_DECAY = 0.0010
-DECAY_ROUND = 25
-
-BETA = 0.01
-DAMPING = 0.1
-GRAD_CLIP = 5.0
 SEED = 42
+GRAD_CLIP = 5.0
 
 
 # ==============================================================
@@ -44,9 +37,6 @@ SEED = 42
 
 def loga(msg):
     print(msg, flush=True)
-
-def logd(msg):
-    pass
 
 
 # ==============================================================
@@ -62,11 +52,11 @@ def set_seed(s):
 
 
 # ==============================================================
-# DATASET WRAPPER — Resize 160 + augment “classico”
+# RAW DATASET WRAPPER
 # ==============================================================
 
 class RawDataset(Dataset):
-    def __init__(self, data, labels, indices, augment=False):
+    def __init__(self, data, labels, indices, augment, resize_size):
         self.data = data
         self.labels = labels
         self.indices = indices
@@ -76,18 +66,17 @@ class RawDataset(Dataset):
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
 
-                transforms.Resize(160),
+                transforms.Resize(resize_size),
 
                 transforms.ToTensor(),
                 transforms.Normalize((0.485, 0.456, 0.406),
                                      (0.229, 0.224, 0.225)),
 
-                # regolarizzazione moderata (non estrema)
                 transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(160),
+                transforms.Resize(resize_size),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485, 0.456, 0.406),
                                      (0.229, 0.224, 0.225)),
@@ -98,8 +87,7 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]
-        img = to_pil_image(img)
+        img = to_pil_image(self.data[idx])
         img = self.T(img)
         return img, self.labels[idx]
 
@@ -129,7 +117,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ==============================================================
-# MODEL — ResNet18 con SOLO layer3+layer4+fc sbloccati
+# MODEL (layer3+layer4+fc sbloccati)
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
@@ -144,9 +132,8 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # 🔒 layer1 / layer2 congelati, 🔓 layer3 / layer4 / fc
         for name, p in self.m.named_parameters():
-            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+            if "layer3" in name or "layer4" in name or "fc" in name:
                 p.requires_grad = True
             else:
                 p.requires_grad = False
@@ -171,19 +158,13 @@ def preprocess_raw_dataset(ds_name):
         d = datasets.CIFAR10("./data", train=True, download=True)
         data = torch.tensor(d.data).permute(0, 3, 1, 2)
         labels = torch.tensor(d.targets)
-    elif ds_name == "CIFAR100":
+    else:
         d = datasets.CIFAR100("./data", train=True, download=True)
         data = torch.tensor(d.data).permute(0, 3, 1, 2)
         labels = torch.tensor(d.targets)
-    else:
-        from torchvision.datasets import SVHN
-        d = SVHN("./data", split="train", download=True)
-        data = torch.tensor(d.data).permute(0, 3, 1, 2)
-        labels = torch.tensor(d.labels)
 
     torch.save(data, data_file)
     torch.save(labels, label_file)
-
     return data, labels
 
 
@@ -191,19 +172,17 @@ def preprocess_raw_dataset(ds_name):
 # CLIENT WORKER
 # ==============================================================
 
-def client_update_worker(args):
+def client_update_worker(args, CONFIG):
+
+    resize_size = CONFIG["resize"]
     device = f"cuda:{args.gpu}"
 
     data = torch.load(f"cached/{args.dataset}_train_raw.pt")
     labels = torch.load(f"cached/{args.dataset}_train_labels.pt")
     indices = torch.load(args.train_idx)
 
-    ds = RawDataset(data, labels, indices, augment=True)
-
-    loader = DataLoader(
-        ds, batch_size=BATCH, shuffle=True,
-        num_workers=2, pin_memory=True
-    )
+    ds = RawDataset(data, labels, indices, augment=True, resize_size=resize_size)
+    loader = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=2, pin_memory=True)
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
@@ -216,7 +195,9 @@ def client_update_worker(args):
 
     old_params = [p.detach().clone().cpu() for p in trainable]
 
-    opt = optim.SGD(trainable, lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    opt = optim.SGD(trainable, lr=args.lr,
+                    momentum=CONFIG["momentum"],
+                    weight_decay=CONFIG["wd"])
     loss_fn = nn.CrossEntropyLoss()
 
     E = len(loader)
@@ -231,17 +212,17 @@ def client_update_worker(args):
             loss.backward()
 
             for i, p in enumerate(trainable):
-                p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
+                p.grad += CONFIG["damping"] * (c_global[i].to(device) - c_local[i].to(device))
 
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
 
     new_params = [p.detach().clone().cpu() for p in trainable]
-    delta_c = []
 
+    delta_c = []
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
-        dc = BETA * (diff / max(E, 1))
+        dc = CONFIG["beta"] * (diff / max(E, 1))
         delta_c.append(dc)
         c_local[i] += dc
 
@@ -271,15 +252,50 @@ def evaluate(model, loader, device):
 
 
 # ==============================================================
-# FEDERATED LOOP (con mini keep-alive)
+# CONFIG MODES (B and C)
 # ==============================================================
 
-def federated_run(ds_name, gpus):
+def get_config_for_mode(mode):
+
+    if mode == "B":
+        return {
+            "resize": 160,
+            "lr_init": 0.006,
+            "lr_decay": 0.002,
+            "decay_round": 25,
+            "momentum": 0.9,
+            "wd": 5e-4,
+            "damping": 0.05,
+            "beta": 0.01,
+            "keepalive": 5.0,
+        }
+
+    if mode == "C":
+        return {
+            "resize": 224,
+            "lr_init": 0.0045,
+            "lr_decay": 0.0015,
+            "decay_round": 25,
+            "momentum": 0.9,
+            "wd": 5e-4,
+            "damping": 0.10,
+            "beta": 0.01,
+            "keepalive": 5.0,
+        }
+
+    raise ValueError("Unknown mode:", mode)
+
+
+# ==============================================================
+# FEDERATED LOOP
+# ==============================================================
+
+def federated_run(ds_name, gpus, CONFIG):
 
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
     transform_test = transforms.Compose([
-        transforms.Resize(160),
+        transforms.Resize(CONFIG["resize"]),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406),
                              (0.229, 0.224, 0.225)),
@@ -288,13 +304,9 @@ def federated_run(ds_name, gpus):
     if ds_name == "CIFAR10":
         te = datasets.CIFAR10("./data", train=False, download=True, transform=transform_test)
         nc = 10
-    elif ds_name == "CIFAR100":
+    else:
         te = datasets.CIFAR100("./data", train=False, download=True, transform=transform_test)
         nc = 100
-    else:
-        from torchvision.datasets import SVHN
-        te = SVHN("./data", split="test", download=True, transform=transform_test)
-        nc = 10
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
 
@@ -316,20 +328,16 @@ def federated_run(ds_name, gpus):
         torch.save(global_model.state_dict(), "global_ckpt/global_round_0.pth")
 
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
-        c_local = [
-            [torch.zeros_like(p).cpu() for p in trainable]
-            for _ in range(NUM_CLIENTS)
-        ]
+        c_local = [[torch.zeros_like(p).cpu() for p in trainable] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
-            lr = LR_INIT if rnd <= DECAY_ROUND else LR_DECAY
+            lr = CONFIG["lr_init"] if rnd <= CONFIG["decay_round"] else CONFIG["lr_decay"]
 
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
-            # piccola barriera per evitare file corrotti
-            for _ in range(300):  # max ~3s
+            for _ in range(300):
                 if os.path.exists(state_c_path) and os.path.getsize(state_c_path) > 1024:
                     break
                 time.sleep(0.01)
@@ -362,60 +370,41 @@ def federated_run(ds_name, gpus):
                     "--state_c", state_c_path,
                     "--train_idx", idx_paths[cid],
                     "--lr", str(lr),
-                    "--output", outp
+                    "--output", outp,
+                    "--mode", CONFIG["mode"]
                 ]
 
-                p = subprocess.Popen(cmd)
-                procs.append(p)
+                procs.append(subprocess.Popen(cmd))
 
-            # 🔸 MINI KEEP-ALIVE: una riga ogni 5s max finché i worker non hanno finito
+            # KEEP ALIVE
             while True:
-                all_done = True
-                for p in procs:
-                    if p.poll() is None:
-                        all_done = False
-                        break
-                if all_done:
+                if all(p.poll() is not None for p in procs):
                     break
                 loga(f"[SERVER] Waiting workers at round {rnd}...")
-                time.sleep(5.0)
+                time.sleep(CONFIG["keepalive"])
 
-            time.sleep(0.05)
-
-            missing = [f for f in out_paths if not os.path.exists(f)]
-            if missing:
-                print("\n❌ ERRORE WORKER: file mancanti:")
-                for m in missing:
-                    print(" -", m)
-                sys.exit(1)
-
-            updates = [
-                torch.load(out_paths[c], map_location="cpu")
-                for c in range(NUM_CLIENTS)
-            ]
+            # AGGREGATION
+            updates = [torch.load(out_paths[c], map_location="cpu")
+                       for c in range(NUM_CLIENTS)]
 
             new_accum = None
             for u in updates:
                 if new_accum is None:
-                    new_accum = [
-                        torch.zeros_like(p) for p in u["new_params"]
-                    ]
+                    new_accum = [torch.zeros_like(p) for p in u["new_params"]]
                 for i, p in enumerate(u["new_params"]):
                     new_accum[i] += p
 
             avg_params = [p / NUM_CLIENTS for p in new_accum]
 
-            idx = 0
             with torch.no_grad():
+                pi = 0
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[idx].to(device0))
-                        idx += 1
+                        p.copy_(avg_params[pi].to(device0))
+                        pi += 1
 
             for i in range(len(c_global)):
-                c_global[i] = (
-                    sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
-                )
+                c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
             for u in updates:
                 c_local[u["cid"]] = u["new_c_local"]
@@ -431,7 +420,7 @@ def federated_run(ds_name, gpus):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
-    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--dataset", type=str, default="CIFAR10")
     parser.add_argument("--num_classes", type=int)
     parser.add_argument("--cid", type=int)
     parser.add_argument("--gpu", type=int)
@@ -441,15 +430,19 @@ def main():
     parser.add_argument("--output", type=str)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--mode", type=str, default="B")
     args = parser.parse_args()
 
+    CONFIG = get_config_for_mode(args.mode)
+    CONFIG["mode"] = args.mode
+
     if args.worker:
-        return client_update_worker(args)
+        return client_update_worker(args, CONFIG)
 
     set_seed(SEED)
 
-    for ds in ["CIFAR10"]:
-        federated_run(ds, args.gpus)
+    federated_run("CIFAR10", args.gpus, CONFIG)
+
 
 if __name__ == "__main__":
     main()
