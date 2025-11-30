@@ -69,7 +69,7 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(112, antialias=True),   # 🔥 FIX
+                transforms.Resize(112),               # 🔥 FIX
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -77,7 +77,7 @@ class RawDataset(Dataset):
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(112, antialias=True),    # 🔥 FIX
+                transforms.Resize(112),               # 🔥 FIX
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -90,7 +90,7 @@ class RawDataset(Dataset):
         idx = self.indices[i]
         img = self.data[idx]   # torch uint8 (3,32,32)
 
-        # 🔥 FIX: PIL conversion BEFORE transforms
+        # 🔥 FIX: convert to PIL BEFORE transforms
         img = to_pil_image(img)
 
         img = self.T(img)
@@ -265,7 +265,7 @@ def federated_run(ds_name, gpus):
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
     transform_test = transforms.Compose([
-        transforms.Resize(112, antialias=True),     # 🔥 FIX
+        transforms.Resize(112),           # 🔥 FIX
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225)),
