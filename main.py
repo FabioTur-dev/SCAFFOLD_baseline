@@ -28,7 +28,7 @@ LOCAL_EPOCHS = 2
 BATCH = 128
 
 LR_INIT = 0.005
-LR_DECAY = 0.0015     # dopo round 20
+LR_DECAY = 0.0015
 DECAY_ROUND = 20
 
 BETA = 0.01
@@ -61,7 +61,7 @@ def set_seed(s):
 
 
 # ==============================================================
-# DATASET WRAPPER — Resize 192 + augment corretto
+# DATASET WRAPPER — Resize 192 + balanced augment
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -75,7 +75,6 @@ class RawDataset(Dataset):
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
 
-                # 🔧 Augment corretto
                 transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
 
                 transforms.Resize(192),
@@ -99,10 +98,8 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]
-        img = to_pil_image(img)
-        img = self.T(img)
-        return img, self.labels[idx]
+        img = to_pil_image(self.data[idx])
+        return self.T(img), self.labels[idx]
 
 
 # ==============================================================
@@ -112,9 +109,8 @@ class RawDataset(Dataset):
 def dirichlet_split(labels, n_clients, alpha):
     labels = np.array(labels)
     per = [[] for _ in range(n_clients)]
-    classes = np.unique(labels)
 
-    for c in classes:
+    for c in np.unique(labels):
         idx = np.where(labels == c)[0]
         np.random.shuffle(idx)
         p = np.random.dirichlet([alpha] * n_clients)
@@ -123,19 +119,19 @@ def dirichlet_split(labels, n_clients, alpha):
         for i in range(n_clients):
             per[i].extend(chunks[i])
 
-    for cl in per:
-        random.shuffle(cl)
-
+    for c in per:
+        random.shuffle(c)
     return per
 
 
 # ==============================================================
-# MODEL — ResNet18 con layer2+3+4+fc sbloccati
+# MODEL — ResNet18 with layer2+3+4+fc unlocked
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
+
         try:
             from torchvision.models import ResNet18_Weights
             self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
@@ -145,7 +141,6 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # 🔧 Sblocco corretto
         for name, p in self.m.named_parameters():
             if ("layer2" in name) or ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -157,34 +152,27 @@ class ResNet18Pre(nn.Module):
 
 
 # ==============================================================
-# PREPROCESS RAW
+# PREPROCESS
 # ==============================================================
 
 def preprocess_raw_dataset(ds_name):
     os.makedirs("cached", exist_ok=True)
-    data_file = f"cached/{ds_name}_train_raw.pt"
-    label_file = f"cached/{ds_name}_train_labels.pt"
+    data_path = f"cached/{ds_name}_train_raw.pt"
+    label_path = f"cached/{ds_name}_train_labels.pt"
 
-    if os.path.exists(data_file) and os.path.exists(label_file):
-        return torch.load(data_file), torch.load(label_file)
+    if os.path.exists(data_path):
+        return torch.load(data_path), torch.load(label_path)
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
         data = torch.tensor(d.data).permute(0,3,1,2)
         labels = torch.tensor(d.targets)
-    elif ds_name == "CIFAR100":
-        d = datasets.CIFAR100("./data", train=True, download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)
-        labels = torch.tensor(d.targets)
+
     else:
-        from torchvision.datasets import SVHN
-        d = SVHN("./data", split="train", download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)
-        labels = torch.tensor(d.labels)
+        raise ValueError("Only CIFAR10 supported here")
 
-    torch.save(data, data_file)
-    torch.save(labels, label_file)
-
+    torch.save(data, data_path)
+    torch.save(labels, label_path)
     return data, labels
 
 
@@ -200,11 +188,8 @@ def client_update_worker(args):
     indices = torch.load(args.train_idx)
 
     ds = RawDataset(data, labels, indices, augment=True)
-
-    loader = DataLoader(
-        ds, batch_size=BATCH, shuffle=True,
-        num_workers=2, pin_memory=True
-    )
+    loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
+                        num_workers=2, pin_memory=True)
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
@@ -239,7 +224,6 @@ def client_update_worker(args):
 
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
-
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
         dc = BETA * (diff / max(E, 1))
@@ -260,8 +244,7 @@ def client_update_worker(args):
 
 def evaluate(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
+    correct, total = 0, 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
@@ -272,7 +255,7 @@ def evaluate(model, loader, device):
 
 
 # ==============================================================
-# FEDERATED LOOP
+# FEDERATED LOOP (WITH SYNC FIX)
 # ==============================================================
 
 def federated_run(ds_name, gpus):
@@ -287,22 +270,16 @@ def federated_run(ds_name, gpus):
     ])
 
     if ds_name == "CIFAR10":
-        te = datasets.CIFAR10("./data", train=False, download=True, transform=transform_test)
+        te = datasets.CIFAR10("./data", train=False, download=True,
+                              transform=transform_test)
         nc = 10
-    elif ds_name == "CIFAR100":
-        te = datasets.CIFAR100("./data", train=False, download=True, transform=transform_test)
-        nc = 100
     else:
-        from torchvision.datasets import SVHN
-        te = SVHN("./data", split="test", download=True, transform=transform_test)
-        nc = 10
+        raise ValueError("Only CIFAR10 used here")
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
-
     labels_np = raw_labels.numpy()
 
     for alpha in DIR_ALPHAS:
-
         loga(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
 
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
@@ -324,11 +301,20 @@ def federated_run(ds_name, gpus):
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
-            # 🔧 LR FIX: fissa i primi 20 round, poi decay
             lr = LR_INIT if rnd <= DECAY_ROUND else LR_DECAY
 
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
+
+            # ------------------------------------------------
+            # 🔐 SYNC FIX: WAIT UNTIL state_c.pth IS FULLY WRITTEN
+            # ------------------------------------------------
+            for _ in range(300):  # max 3s
+                if os.path.exists(state_c_path) and os.path.getsize(state_c_path) > 1024:
+                    break
+                time.sleep(0.01)
+            else:
+                raise RuntimeError("state_c.pth NOT written correctly!")
 
             idx_paths = []
             for cid in range(NUM_CLIENTS):
@@ -369,17 +355,12 @@ def federated_run(ds_name, gpus):
 
             time.sleep(0.05)
 
-            missing = [f for f in out_paths if not os.path.exists(f)]
-            if missing:
-                print("\n❌ ERRORE WORKER: file mancanti:")
-                for m in missing:
-                    print(" -", m)
-                sys.exit(1)
+            for f in out_paths:
+                if not os.path.exists(f):
+                    print("❌ Missing worker output:", f)
+                    sys.exit(1)
 
-            updates = [
-                torch.load(out_paths[c], map_location="cpu")
-                for c in range(NUM_CLIENTS)
-            ]
+            updates = [torch.load(p, map_location="cpu") for p in out_paths]
 
             new_accum = None
             for u in updates:
@@ -440,6 +421,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
