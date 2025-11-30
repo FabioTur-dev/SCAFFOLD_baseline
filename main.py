@@ -7,7 +7,6 @@ import subprocess
 import sys
 import random
 import numpy as np
-import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
 
 # ==============================================================
-# CONFIG (MAGICAL SCAFFOLD-LITE)
+# CONFIG (SCAFFOLD-Lite Stable)
 # ==============================================================
 
 NUM_CLIENTS = 10
@@ -34,14 +33,14 @@ GRAD_CLIP = 5.0
 SEED = 42
 
 # ==============================================================
-# LOGGING
+# LOGGING — only accuracy per round
 # ==============================================================
 
 def loga(msg):
     print(msg, flush=True)
 
 def logd(msg):
-    pass
+    pass    # debug disabilitato
 
 # ==============================================================
 # SEED
@@ -55,7 +54,7 @@ def set_seed(s):
         torch.cuda.manual_seed_all(s)
 
 # ==============================================================
-# RAW DATASET WRAPPER — VERSIONE MAGICA
+# RAW DATASET WRAPPER (dynamic augmentation)
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -68,25 +67,18 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(224),          # <--- Resize su TENSOR (MAGICO)
-                transforms.ToTensor(),           # <--- applicato su tensor uint8
-                transforms.Normalize(
-                    (0.485,0.456,0.406),
-                    (0.229,0.224,0.225)
-                ),
-                transforms.RandomErasing(
-                    p=0.25,
-                    scale=(0.02, 0.2)
-                )                                # <--- ERASE DEBOLE (MAGICO)
+                transforms.Resize(224),
+                transforms.ToTensor(),
+                transforms.Normalize((0.485,0.456,0.406),
+                                     (0.229,0.224,0.225)),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.2))
             ])
         else:
             self.T = transforms.Compose([
                 transforms.Resize(224),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    (0.485,0.456,0.406),
-                    (0.229,0.224,0.225)
-                ),
+                transforms.Normalize((0.485,0.456,0.406),
+                                     (0.229,0.224,0.225)),
             ])
 
     def __len__(self):
@@ -94,8 +86,8 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = self.data[idx]     # torch uint8 CHW  (MAGICO)
-        img = self.T(img)        # direttamente nelle transforms (MAGICO)
+        img = self.data[idx]           # raw uint8 CHW
+        img = self.T(img)
         return img, self.labels[idx]
 
 # ==============================================================
@@ -137,6 +129,7 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # Freeze except last blocks
         for name, p in self.m.named_parameters():
             if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
                 p.requires_grad = True
@@ -147,7 +140,7 @@ class ResNet18Pre(nn.Module):
         return self.m(x)
 
 # ==============================================================
-# PREPROCESS RAW DATASET
+# PREPROCESS RAW DATASET ONCE
 # ==============================================================
 
 def preprocess_raw_dataset(ds_name):
@@ -156,11 +149,13 @@ def preprocess_raw_dataset(ds_name):
     label_file = f"cached/{ds_name}_train_labels.pt"
 
     if os.path.exists(data_file) and os.path.exists(label_file):
-        return torch.load(data_file), torch.load(label_file)
+        data = torch.load(data_file)
+        labels = torch.load(label_file)
+        return data, labels
 
     if ds_name == "CIFAR10":
         d = datasets.CIFAR10("./data", train=True, download=True)
-        data = torch.tensor(d.data).permute(0,3,1,2)
+        data = torch.tensor(d.data).permute(0,3,1,2)  # N×3×32×32 uint8
         labels = torch.tensor(d.targets)
     elif ds_name == "CIFAR100":
         d = datasets.CIFAR100("./data", train=True, download=True)
@@ -174,10 +169,11 @@ def preprocess_raw_dataset(ds_name):
 
     torch.save(data, data_file)
     torch.save(labels, label_file)
+
     return data, labels
 
 # ==============================================================
-# WORKER
+# WORKER — SCAFFOLD-Lite + Dynamic Augmentation
 # ==============================================================
 
 def client_update_worker(args):
@@ -188,8 +184,11 @@ def client_update_worker(args):
     indices = torch.load(args.train_idx)
 
     ds = RawDataset(data, labels, indices, augment=True)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=True,
-                        num_workers=2, pin_memory=True)
+
+    loader = DataLoader(
+        ds, batch_size=BATCH, shuffle=True,
+        num_workers=2, pin_memory=True
+    )
 
     model = ResNet18Pre(args.num_classes).to(device)
     model.load_state_dict(torch.load(args.global_ckpt, map_location="cpu"))
@@ -204,7 +203,6 @@ def client_update_worker(args):
 
     opt = optim.SGD(trainable, lr=args.lr, momentum=0.9, weight_decay=5e-4)
     loss_fn = nn.CrossEntropyLoss()
-
     E = len(loader)
 
     for _ in range(LOCAL_EPOCHS):
@@ -216,9 +214,9 @@ def client_update_worker(args):
             loss = loss_fn(out, yb)
             loss.backward()
 
+            # Scaffold-Lite grad correction
             for i, p in enumerate(trainable):
-                p.grad += DAMPING * (c_global[i].to(device) -
-                                     c_local[i].to(device))
+                p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
@@ -236,52 +234,53 @@ def client_update_worker(args):
         "cid": args.cid,
         "new_params": new_params,
         "new_c_local": c_local,
-        "delta_c": delta_c
+        "delta_c": delta_c,
     }, args.output)
 
     return
 
 # ==============================================================
-# EVAL
+# EVALUATION
 # ==============================================================
 
 def evaluate(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
-
+    correct = total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             pred = model(x).argmax(1)
             correct += (pred == y).sum().item()
             total += y.size(0)
-
     return correct / total
 
 # ==============================================================
-# FEDERATED LOOP — VERSIONE MAGICA + WORKER CUSHION
+# FEDERATED LOOP
 # ==============================================================
 
 def federated_run(ds_name, gpus):
 
+    # raw data cached una sola volta
     raw_data, raw_labels = preprocess_raw_dataset(ds_name)
 
+    # Test loader con norm corretta
     transform_test = transforms.Compose([
         transforms.Resize(224),
         transforms.ToTensor(),
-        transforms.Normalize(
-            (0.485,0.456,0.406),
-            (0.229,0.224,0.225)
-        ),
+        transforms.Normalize((0.485,0.456,0.406),
+                             (0.229,0.224,0.225)),
     ])
 
     if ds_name == "CIFAR10":
-        te = datasets.CIFAR10("./data", train=False, download=True,
-                              transform=transform_test)
+        te = datasets.CIFAR10("./data", train=False, download=True, transform=transform_test)
         nc = 10
+    elif ds_name == "CIFAR100":
+        te = datasets.CIFAR100("./data", train=False, download=True, transform=transform_test)
+        nc = 100
     else:
-        raise ValueError("Use CIFAR10")
+        from torchvision.datasets import SVHN
+        te = SVHN("./data", split="test", download=True, transform=transform_test)
+        nc = 10
 
     testloader = DataLoader(te, batch_size=256, shuffle=False)
 
@@ -311,19 +310,22 @@ def federated_run(ds_name, gpus):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_INIT * 0.1
 
+            # Save control variates
             state_c_path = "global_ckpt/state_c.pth"
             torch.save({"c_local": c_local, "c_global": c_global}, state_c_path)
 
+            # Save indices
             idx_paths = []
             for cid in range(NUM_CLIENTS):
                 path = f"global_ckpt/train_idx_{cid}.pth"
                 torch.save(splits[cid], path)
                 idx_paths.append(path)
 
+            # Save global model
             global_ckpt_path = f"global_ckpt/global_round_{rnd-1}.pth"
             torch.save(global_model.state_dict(), global_ckpt_path)
 
-            # ---------- WORKER LAUNCH ----------
+            # Launch workers (silenziosi)
             procs = []
             out_paths = []
 
@@ -355,34 +357,14 @@ def federated_run(ds_name, gpus):
             for p in procs:
                 p.wait()
 
-            time.sleep(0.10)     # <--- CUSCINETTO SICUREZZA FS
-
-            # Retry loading 3 times if worker writes late
-            updates = []
-            for attempt in range(3):
-                missing = [f for f in out_paths if not os.path.exists(f)]
-                if not missing:
-                    break
-                time.sleep(0.15)
-
-            missing = [f for f in out_paths if not os.path.exists(f)]
-            if missing:
-                print("\n❌ Worker crash: files mancanti:")
-                for m in missing:
-                    print(" -", m)
-                sys.exit(1)
-
-            # ---------- AGGREGATION ----------
-            updates = [
-                torch.load(out_paths[c], map_location="cpu")
-                for c in range(NUM_CLIENTS)
-            ]
+            # Aggregate
+            updates = [torch.load(out_paths[c], map_location="cpu")
+                       for c in range(NUM_CLIENTS)]
 
             new_accum = None
             for u in updates:
                 if new_accum is None:
-                    new_accum = [torch.zeros_like(p)
-                                 for p in u["new_params"]]
+                    new_accum = [torch.zeros_like(p) for p in u["new_params"]]
                 for i, p in enumerate(u["new_params"]):
                     new_accum[i] += p
 
@@ -395,13 +377,14 @@ def federated_run(ds_name, gpus):
                         p.copy_(avg_params[idx_param].to(device0))
                         idx_param += 1
 
+            # Update control variates
             for i in range(len(c_global)):
-                c_global[i] = sum(u["delta_c"][i]
-                                  for u in updates) / NUM_CLIENTS
+                c_global[i] = sum(u["delta_c"][i] for u in updates) / NUM_CLIENTS
 
             for u in updates:
                 c_local[u["cid"]] = u["new_c_local"]
 
+            # Eval
             acc = evaluate(global_model, testloader, device0)
             loga(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
@@ -430,9 +413,9 @@ def main():
 
     set_seed(SEED)
 
+    # se vuoi solo CIFAR10, lascia così; altrimenti aggiungi CIFAR100, SVHN
     for ds in ["CIFAR10"]:
         federated_run(ds, args.gpus)
-
 
 if __name__ == "__main__":
     main()
