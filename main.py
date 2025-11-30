@@ -24,11 +24,11 @@ from torchvision.transforms.functional import to_pil_image
 
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5, 0.1, 0.05]
-NUM_ROUNDS = 100
+NUM_ROUNDS = 50
 LOCAL_EPOCHS = 2
 BATCH = 128
 
-LR_INIT = 0.003
+LR_INIT = 0.03
 LR_DECAY = 0.0015
 DECAY_ROUND = 20
 
