@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, random, numpy as np, scipy.io as sio, cv2, torch
+import random
+import numpy as np
+import scipy.io as sio
+import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -27,7 +30,7 @@ DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
 
-IMG_SIZE = 160   # final resolution
+IMG_SIZE = 160   # target resolution
 
 
 def set_seed(s):
@@ -42,60 +45,51 @@ def log(x):
 
 
 # ======================================================
-# GPU AUGMENT — LIGHT
+# GPU AUGMENT (leggero)
 # ======================================================
 
 def gpu_augment(x):
     # x: [B,3,H,W]
     if torch.rand(1) < 0.5:
-        x = torch.flip(x, dims=[3])
+        x = torch.flip(x, dims=[3])  # flip orizzontale
     return x
 
 
 # ======================================================
-# SAFE SVHN LOADER (CPU + OpenCV)
+# SVHN loader (CPU), niente cv2, niente PIL
 # ======================================================
 
-def load_svhn_preprocessed_cpu(path):
-    """Load SVHN mat -> ndarray -> resize on CPU -> tensor on CPU."""
-
+def load_svhn_raw(path):
+    """
+    Carica SVHN da file .mat e restituisce:
+    - X: tensor CPU uint8 di shape [N, 3, 32, 32]
+    - y: tensor CPU long di shape [N]
+    """
     mat = sio.loadmat(path)
-    X = mat["X"]                           # (32,32,3,N)
-    y = mat["y"].squeeze()
+    X = mat["X"]              # (32, 32, 3, N)
+    y = mat["y"].squeeze()    # (N,)
+
     y[y == 10] = 0
     y = y.astype(np.int64)
 
-    # Convert to (N,32,32,3)
-    X = np.transpose(X, (3, 0, 1, 2))
+    # (32,32,3,N) -> (N,3,32,32)
+    X = np.transpose(X, (3, 2, 0, 1))
 
-    # Preallocate final array: CPU float32
-    N = X.shape[0]
-    X_big = np.empty((N, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
+    X_t = torch.from_numpy(X).to(torch.uint8)   # [N,3,32,32]
+    y_t = torch.from_numpy(y).long()            # [N]
 
-    # Resize on CPU with OpenCV (fast)
-    for i in range(N):
-        img = X[i]
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
-        X_big[i] = img / 255.0
-
-    # Convert to channel-first PyTorch CPU tensor
-    X_big = torch.tensor(X_big).permute(0,3,1,2)  # (N,3,H,W)
-
-    # Normalize on CPU
-    mean = torch.tensor([0.5,0.5,0.5]).view(1,3,1,1)
-    std  = torch.tensor([0.5,0.5,0.5]).view(1,3,1,1)
-    X_big = (X_big - mean) / std
-
-    y = torch.tensor(y, dtype=torch.long)
-
-    return X_big, y
+    return X_t, y_t
 
 
 # ======================================================
-# DIRICHLET
+# DIRICHLET SPLIT
 # ======================================================
 
 def dirichlet_split(labels, n_clients, alpha):
+    """
+    labels: torch.LongTensor CPU [N]
+    restituisce: lista di liste di indici per client
+    """
     labels_np = labels.numpy()
     per = [[] for _ in range(n_clients)]
     classes = np.unique(labels_np)
@@ -104,43 +98,48 @@ def dirichlet_split(labels, n_clients, alpha):
         idx = np.where(labels_np == c)[0]
         np.random.shuffle(idx)
         p = np.random.dirichlet([alpha] * n_clients)
-        cuts = (np.cumsum(p)*len(idx)).astype(int)
+        cuts = (np.cumsum(p) * len(idx)).astype(int)
         chunks = np.split(idx, cuts[:-1])
         for cid in range(n_clients):
             per[cid].extend(chunks[cid])
 
-    # ensure no empty client
+    # evita client vuoti
     for cid in range(n_clients):
         if len(per[cid]) == 0:
             per[cid].append(np.random.randint(0, len(labels_np)))
+
+    # shuffle finale per client
+    for cid in range(n_clients):
+        random.shuffle(per[cid])
 
     return per
 
 
 # ======================================================
-# RESNET18 — train only layer3, layer4, fc
+# RESNET18 – solo layer3, layer4, fc allenabili
 # ======================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
 
+        # compatibile con versioni vecchie di torchvision
         try:
             self.m = models.resnet18(weights="IMAGENET1K_V1")
-        except:
+        except Exception:
             try:
                 self.m = models.resnet18(pretrained=True)
-            except:
+            except Exception:
                 self.m = models.resnet18()
 
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # Freeze all
+        # freeza tutto
         for p in self.m.parameters():
             p.requires_grad = False
 
-        # Unfreeze only layer3,4,fc
+        # sblocca solo layer3, layer4, fc
         for name, p in self.m.named_parameters():
             if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
                 p.requires_grad = True
@@ -150,42 +149,59 @@ class ResNet18Pre(nn.Module):
 
 
 # ======================================================
-# LOCAL TRAINING (CPU arrays -> GPU batch)
+# LOCAL TRAINING – SCAFFOLD + resize on-the-fly
 # ======================================================
 
-def run_client(model, idxs, X, y, c_global, c_local, lr, device):
-
+def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
+    """
+    model: ResNet18Pre su GPU
+    idxs: lista di indici di questo client
+    X_cpu_u8: tensor CPU uint8 [N,3,32,32]
+    y_cpu: tensor CPU long [N]
+    c_global, c_local: liste di tensori (stesso device della model)
+    """
     model.train()
     train_params = [p for p in model.parameters() if p.requires_grad]
 
+    # copia parametri di partenza
     old_params = [p.detach().clone() for p in train_params]
 
     opt = optim.SGD(train_params, lr=lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    for start in range(0, len(idxs), BATCH):
-        batch_idx = idxs[start:start+BATCH]
+    # mean/std su device una sola volta
+    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
 
-        xb = X[batch_idx].to(device)    # move batch only
-        yb = y[batch_idx].to(device)
+    for _ in range(LOCAL_EPOCHS):
+        for start in range(0, len(idxs), BATCH):
+            batch_idx = idxs[start:start + BATCH]
 
-        xb = gpu_augment(xb)
+            xb_u8 = X_cpu_u8[batch_idx]          # [b,3,32,32] CPU uint8
+            yb = y_cpu[batch_idx].to(device)     # [b] GPU long
 
-        opt.zero_grad()
-        out = model(xb)
-        loss = loss_fn(out, yb)
-        loss.backward()
+            xb = xb_u8.to(device=device, dtype=torch.float32) / 255.0
+            # resize a 160x160 solo per questo batch
+            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
+            xb = (xb - mean) / std
 
-        # SCAFFOLD correction
-        for i, p in enumerate(train_params):
-            p.grad += DAMPING * (c_global[i] - c_local[i])
+            xb = gpu_augment(xb)
 
-        torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
-        opt.step()
+            opt.zero_grad()
+            out = model(xb)
+            loss = loss_fn(out, yb)
+            loss.backward()
 
+            # SCAFFOLD correction
+            for i, p in enumerate(train_params):
+                p.grad += DAMPING * (c_global[i] - c_local[i])
+
+            torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
+            opt.step()
+
+    # compute deltas
     new_params = [p.detach().clone() for p in train_params]
     delta_c = []
-
     E = max(1, len(idxs) // BATCH)
 
     for i in range(len(train_params)):
@@ -198,20 +214,29 @@ def run_client(model, idxs, X, y, c_global, c_local, lr, device):
 
 
 # ======================================================
-# EVAL
+# EVAL – resize on-the-fly
 # ======================================================
 
-def evaluate(model, X, y, device):
+def evaluate(model, X_cpu_u8, y_cpu, device):
     model.eval()
     correct = 0
-    tot = len(y)
+    tot = len(y_cpu)
+
+    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
 
     with torch.no_grad():
         for start in range(0, tot, 256):
-            xb = X[start:start+256].to(device)
+            xb_u8 = X_cpu_u8[start:start + 256]
+            yb = y_cpu[start:start + 256].to(device)
+
+            xb = xb_u8.to(device=device, dtype=torch.float32) / 255.0
+            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
+            xb = (xb - mean) / std
+
             out = model(xb)
-            pred = out.argmax(1).cpu()
-            correct += (pred == y[start:start+256]).sum().item()
+            pred = out.argmax(1)
+            correct += (pred == yb).sum().item()
 
     return correct / tot
 
@@ -221,15 +246,13 @@ def evaluate(model, X, y, device):
 # ======================================================
 
 def federated_run():
-
     device = "cuda:0"
 
-    log("Preprocessing SVHN on CPU…")
-    X_train, y_train = load_svhn_preprocessed_cpu("./data/train_32x32.mat")
-    X_test,  y_test  = load_svhn_preprocessed_cpu("./data/test_32x32.mat")
+    log("Carico SVHN (CPU, 32x32)...")
+    X_train, y_train = load_svhn_raw("./data/train_32x32.mat")
+    X_test, y_test = load_svhn_raw("./data/test_32x32.mat")
 
     for alpha in DIR_ALPHAS:
-
         log(f"\n==== SVHN | α={alpha} ====\n")
 
         splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
@@ -237,10 +260,11 @@ def federated_run():
         global_model = ResNet18Pre(10).to(device)
         train_params = [p for p in global_model.parameters() if p.requires_grad]
 
+        # SCAFFOLD c-variates
         c_global = [torch.zeros_like(p) for p in train_params]
         c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
-        for rnd in range(1, NUM_ROUNDS+1):
+        for rnd in range(1, NUM_ROUNDS + 1):
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
             gs = [p.detach().clone() for p in train_params]
 
@@ -248,14 +272,14 @@ def federated_run():
             delta_c_all = []
 
             for cid in range(NUM_CLIENTS):
-
                 local_model = ResNet18Pre(10).to(device)
 
                 with torch.no_grad():
                     j = 0
                     for p in local_model.parameters():
                         if p.requires_grad:
-                            p.copy_(gs[j]); j+=1
+                            p.copy_(gs[j])
+                            j += 1
 
                 new_params, dc, new_cl = run_client(
                     local_model,
@@ -272,19 +296,20 @@ def federated_run():
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # aggregate
+            # aggregate params
             avg_params = []
             for i in range(len(train_params)):
                 stack = torch.stack([cp[i] for cp in new_params_all])
                 avg_params.append(stack.mean(0))
 
             with torch.no_grad():
-                j=0
+                j = 0
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[j]); j+=1
+                        p.copy_(avg_params[j])
+                        j += 1
 
-            # update c_global
+            # aggregate c_global
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
