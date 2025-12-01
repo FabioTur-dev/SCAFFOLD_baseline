@@ -21,9 +21,9 @@ NUM_ROUNDS = 30
 LOCAL_EPOCHS = 1
 BATCH = 128
 
-# iperparametri che avevano funzionato
+# iperparametri che avevano funzionato meglio
 LR_INIT = 0.01
-LR_DECAY_ROUND = 8      # decadi un po’ prima rispetto a 15
+LR_DECAY_ROUND = 8      # decay un po' anticipato
 LR_DECAY = 0.001
 
 BETA = 0.01
@@ -31,7 +31,7 @@ DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
 
-IMG_SIZE = 160   # risoluzione “magica” che ti dava ~80%
+IMG_SIZE = 160   # risoluzione che ti portava a ~79%
 
 
 def set_seed(s):
@@ -101,7 +101,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================
-# RESNET18 – solo layer3, layer4, fc allenabili
+# RESNET18 – sblocca layer2, layer3, layer4, fc
 # ======================================================
 
 class ResNet18Pre(nn.Module):
@@ -119,13 +119,18 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # freeze tutto
+        # freeza tutto
         for p in self.m.parameters():
             p.requires_grad = False
 
-        # sblocca solo layer3, layer4, fc (come nella versione che andava bene)
+        # sblocca SOLO layer2, layer3, layer4, fc
         for name, p in self.m.named_parameters():
-            if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
+            if (
+                name.startswith("layer2") or
+                name.startswith("layer3") or
+                name.startswith("layer4") or
+                name.startswith("fc")
+            ):
                 p.requires_grad = True
 
     def forward(self, x):
@@ -238,16 +243,13 @@ def federated_run():
 
         for rnd in range(1, NUM_ROUNDS+1):
 
-            # LR schedule semplice
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
 
-            # “foto” globale di partenza
             gs = [p.detach().clone() for p in train_params]
 
             new_params_all = []
             delta_c_all = []
 
-            # randomizza l’ordine dei client ogni round (stabilizza molto)
             client_order = list(range(NUM_CLIENTS))
             random.shuffle(client_order)
 
@@ -276,7 +278,6 @@ def federated_run():
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # agregga parametri
             avg_params = []
             for i in range(len(train_params)):
                 avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
@@ -287,7 +288,6 @@ def federated_run():
                     if p.requires_grad:
                         p.copy_(avg_params[j]); j += 1
 
-            # aggiorna c_global
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
