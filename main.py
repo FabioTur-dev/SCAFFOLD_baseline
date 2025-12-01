@@ -16,12 +16,12 @@ from torchvision import models
 # ======================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.05, 0.5]
+DIR_ALPHAS = [0.5, 0.05]
 NUM_ROUNDS = 30
 LOCAL_EPOCHS = 1
 BATCH = 128
 
-# LR più stabile per α=0.05
+# LR stabile per α=0.05
 LR_INIT = 0.006
 LR_DECAY_ROUND = 15
 LR_DECAY = 0.002
@@ -32,8 +32,8 @@ DAMPING = 0.05
 GRAD_CLIP = 5.0
 SEED = 42
 
-# Risoluzione riportata a 224×224
-IMG_SIZE = 224
+# NUOVA RISOLUZIONE
+IMG_SIZE = 128
 
 
 def set_seed(s):
@@ -58,7 +58,7 @@ def gpu_augment(x):
 
 
 # ======================================================
-# LOAD SVHN RAW (CPU, NO CV2, NO PIL)
+# LOAD SVHN RAW (NO CV2, NO PIL)
 # ======================================================
 
 def load_svhn_raw(path):
@@ -69,8 +69,7 @@ def load_svhn_raw(path):
     y[y == 10] = 0
     y = y.astype(np.int64)
 
-    # Converti (32,32,3,N) → (N,3,32,32)
-    X = np.transpose(X, (3, 2, 0, 1))
+    X = np.transpose(X, (3, 2, 0, 1))  # -> (N,3,32,32)
 
     X_t = torch.from_numpy(X).to(torch.uint8)
     y_t = torch.from_numpy(y).long()
@@ -135,7 +134,7 @@ class ResNet18Pre(nn.Module):
 
 
 # ======================================================
-# LOCAL TRAINING (SCAFFOLD + resize per batch)
+# LOCAL TRAINING (resize per batch)
 # ======================================================
 
 def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
@@ -152,12 +151,12 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
 
     for _ in range(LOCAL_EPOCHS):
         for start in range(0, len(idxs), BATCH):
-            batch_idx = idxs[start:start + BATCH]
+            batch_idx = idxs[start:start+BATCH]
 
             xb_u8 = X_cpu_u8[batch_idx]
-            yb = y_cpu[batch_idx].to(device)
+            yb    = y_cpu[batch_idx].to(device)
 
-            xb = xb_u8.to(device=device, dtype=torch.float32) / 255.0
+            xb = xb_u8.to(device, dtype=torch.float32) / 255.0
             xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
             xb = (xb - mean) / std
 
@@ -174,11 +173,10 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
             torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
             opt.step()
 
-    # compute SCAFFOLD deltas
     new_params = [p.detach().clone() for p in train_params]
     delta_c = []
 
-    E = max(1, len(idxs) // BATCH)
+    E = max(1, len(idxs)//BATCH)
     for i in range(len(train_params)):
         diff = new_params[i] - old_params[i]
         dc = BETA * (diff / E)
@@ -202,10 +200,10 @@ def evaluate(model, X_cpu_u8, y_cpu, device):
 
     with torch.no_grad():
         for start in range(0, tot, 256):
-            xb_u8 = X_cpu_u8[start:start + 256]
-            yb = y_cpu[start:start + 256].to(device)
+            xb_u8 = X_cpu_u8[start:start+256]
+            yb = y_cpu[start:start+256].to(device)
 
-            xb = xb_u8.to(device=device, dtype=torch.float32) / 255.0
+            xb = xb_u8.to(device, dtype=torch.float32) / 255.0
             xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
             xb = (xb - mean) / std
 
@@ -238,8 +236,7 @@ def federated_run():
         c_global = [torch.zeros_like(p) for p in train_params]
         c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
-        for rnd in range(1, NUM_ROUNDS + 1):
-
+        for rnd in range(1, NUM_ROUNDS+1):
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
             gs = [p.detach().clone() for p in train_params]
 
@@ -253,9 +250,9 @@ def federated_run():
                     j = 0
                     for p in local_model.parameters():
                         if p.requires_grad:
-                            p.copy_(gs[j]); j += 1
+                            p.copy_(gs[j]); j+=1
 
-                new_params, dc, new_local_c = run_client(
+                new_params, dc, new_local = run_client(
                     local_model,
                     splits[cid],
                     X_train,
@@ -266,15 +263,14 @@ def federated_run():
                     device
                 )
 
-                c_locals[cid] = new_local_c
+                c_locals[cid] = new_local
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # aggregate params
+            # param avg
             avg_params = []
             for i in range(len(train_params)):
-                stack = torch.stack([client_params[i] for client_params in new_params_all])
-                avg_params.append(stack.mean(0))
+                avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
 
             with torch.no_grad():
                 j = 0
@@ -282,7 +278,7 @@ def federated_run():
                     if p.requires_grad:
                         p.copy_(avg_params[j]); j += 1
 
-            # aggregate c_global
+            # c_global avg
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
