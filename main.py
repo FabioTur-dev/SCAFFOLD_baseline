@@ -75,10 +75,11 @@ class RawDataset(Dataset):
         self.idx = idx
 
         self.T = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.Resize(IMG_SIZE),
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(IMG_SIZE, padding=8),
-            transforms.ToTensor(),  # already tensor, but safe
+            transforms.ToTensor(),
         ])
 
     def __len__(self):
@@ -86,10 +87,19 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         k = self.idx[i]
-        img = self.X[k].numpy()
-        img = transforms.ToPILImage()(img)
+
+        img = self.X[k]
+        # ensure shape is (3, H, W)
+        if img.dim() == 4:
+            # happens if leftover dimension from .mat reshape
+            img = img.squeeze()
+        if img.shape[0] != 3:
+            # reorder if needed
+            img = img.permute(2, 0, 1)
+
         img = self.T(img)
         return img, self.y[k]
+
 
 
 # ==============================================================
