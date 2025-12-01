@@ -4,8 +4,10 @@
 import os, random, numpy as np, scipy.io as sio, torch
 import torch.nn as nn
 import torch.optim as optim
+
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
+from torchvision import models
+import torch.nn.functional as F
 
 
 # ==============================================================
@@ -40,66 +42,58 @@ def log(x):
 
 
 # ==============================================================
-# SVHN LOADER — 100% bulletproof
+# GPU AUGMENTATION — ULTRA FAST
 # ==============================================================
 
-def load_svhn(path):
+def gpu_augment(x):
+    # x shape: [B,3,160,160]
+    # Random horizontal flip
+    if torch.rand(1) < 0.5:
+        x = torch.flip(x, dims=[3])
+
+    # Random crop 160→ slightly jittered 148-160 window
+    crop = int(torch.randint(148, 161, (1,)))
+    if crop != 160:
+        off = torch.randint(0, 160-crop+1, (2,))
+        x = x[:, :, off[0]:off[0]+crop, off[1]:off[1]+crop]
+        x = F.interpolate(x, size=160, mode='bilinear')
+
+    return x
+
+
+# ==============================================================
+# LOAD SVHN — RAW FORMAT -> PREPROCESS -> TENSOR 160×160
+# ==============================================================
+
+def load_svhn_preprocessed(path, device):
+    """Load SVHN mat file and produce [N,3,160,160] float tensor normalized."""
     mat = sio.loadmat(path)
-    X = mat["X"]               # (32,32,3,N)
+    X = mat["X"]                            # (32,32,3,N)
     y = mat["y"].squeeze()
     y[y == 10] = 0
+    y = y.astype(np.int64)
 
-    # (32,32,3,N) -> (N,32,32,3)
-    X = np.transpose(X, (3, 0, 1, 2))
+    # Move to (N,3,32,32)
+    X = np.transpose(X, (3, 2, 0, 1))       # (N,3,32,32)
+    X = torch.tensor(X, dtype=torch.float32, device=device) / 255.
 
-    return X, y.astype(np.int64)
+    # Resize ONCE to 160x160 (GPU)
+    X = F.interpolate(X, size=160, mode="bilinear")
 
+    # Normalize
+    mean = torch.tensor([0.5,0.5,0.5], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.5,0.5,0.5], device=device).view(1,3,1,1)
+    X = (X - mean) / std
 
-# ==============================================================
-# DATASET WRAPPER
-# ==============================================================
-
-class SVHNDataset(Dataset):
-    def __init__(self, X, y, idxs, augment=False):
-        self.X = X
-        self.y = y
-        self.idxs = idxs
-
-        if augment:
-            self.T = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomCrop(32, padding=4),
-                transforms.Resize(160),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))
-            ])
-        else:
-            self.T = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize(160),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))
-            ])
-
-    def __len__(self):
-        return len(self.idxs)
-
-    def __getitem__(self, i):
-        idx = self.idxs[i]
-        img = self.X[idx]          # (32,32,3)
-        label = int(self.y[idx])
-        return self.T(img), label
+    return X, torch.tensor(y, device=device)
 
 
 # ==============================================================
-# DIRICHLET SPLIT (senza client vuoti)
+# DIRICHLET SPLIT (prevents empty clients)
 # ==============================================================
 
 def dirichlet_split(labels, n_clients, alpha):
-    labels = np.array(labels)
-    n = len(labels)
-
+    labels = labels.cpu().numpy()
     per = [[] for _ in range(n_clients)]
     classes = np.unique(labels)
 
@@ -112,20 +106,16 @@ def dirichlet_split(labels, n_clients, alpha):
         for cid in range(n_clients):
             per[cid].extend(chunks[cid])
 
-    # RIMUOVE eventuali client vuoti (causa errore num_samples=0)
     for cid in range(n_clients):
         if len(per[cid]) == 0:
-            # assegna un indice random di emergenza
-            per[cid].append(np.random.randint(0, n))
-
-    for cid in range(n_clients):
+            per[cid].append(np.random.randint(0, len(labels)))
         random.shuffle(per[cid])
 
     return per
 
 
 # ==============================================================
-# RESNET18 COMPATIBILE
+# RESNET18 — compatible with all torchvision
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
@@ -154,40 +144,47 @@ class ResNet18Pre(nn.Module):
 
 
 # ==============================================================
-# LOCAL TRAINING — SCAFFOLD
+# LOCAL CLIENT TRAINING (ULTRA FAST)
 # ==============================================================
 
-def run_client(model, idxs, X, y, c_global, c_local, lr, device):
+def run_client(model, idxs, X, y, c_global, c_local, lr):
 
-    ds = SVHNDataset(X, y, idxs, augment=True)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0)
+    # subset selection — but WITHOUT DataLoader
+    xb = X[idxs]        # [k,3,160,160]
+    yb = y[idxs]        # [k]
 
+    model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
-    old_params = [p.detach().clone().cpu() for p in trainable]
+
+    old_params = [p.detach().clone() for p in trainable]
 
     opt = optim.SGD(trainable, lr=lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    E = max(1, len(loader))
+    # 1 epoch only, but manually batched
+    for start in range(0, len(idxs), BATCH):
+        xb_batch = xb[start:start+BATCH]
+        yb_batch = yb[start:start+BATCH]
 
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
+        # GPU augment
+        xb_batch = gpu_augment(xb_batch)
 
         opt.zero_grad()
-        out = model(xb)
-        loss = loss_fn(out, yb)
+        out = model(xb_batch)
+        loss = loss_fn(out, yb_batch)
         loss.backward()
 
-        # SCAFFOLD correction
         for i, p in enumerate(trainable):
-            p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
+            p.grad += DAMPING * (c_global[i] - c_local[i])
 
         torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
         opt.step()
 
     # compute deltas
-    new_params = [p.detach().clone().cpu() for p in trainable]
+    new_params = [p.detach().clone() for p in trainable]
     delta_c = []
+
+    E = max(1, len(idxs) // BATCH)
 
     for i in range(len(trainable)):
         diff = new_params[i] - old_params[i]
@@ -199,29 +196,20 @@ def run_client(model, idxs, X, y, c_global, c_local, lr, device):
 
 
 # ==============================================================
-# EVAL
+# EVAL — ultra fast
 # ==============================================================
 
 def evaluate(model, X, y):
-    device = next(model.parameters()).device
+    model.eval()
+    correct = 0
+    total = len(y)
 
-    T = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize(160),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,0.5,0.5),(0.5,0.5,0.5))
-    ])
-
-    correct, total = 0, 0
-    for i in range(len(y)):
-        img = T(X[i]).unsqueeze(0).to(device)
-        label = int(y[i])
-
-        with torch.no_grad():
-            pred = model(img).argmax(1).item()
-
-        correct += (pred == label)
-        total += 1
+    with torch.no_grad():
+        for i in range(0, total, 256):
+            xb = X[i:i+256]
+            out = model(xb)
+            pred = out.argmax(1)
+            correct += (pred == y[i:i+256]).sum().item()
 
     return correct / total
 
@@ -234,9 +222,9 @@ def federated_run():
 
     device = "cuda:0"
 
-    # ---- load SVHN ----
-    X_train, y_train = load_svhn("./data/train_32x32.mat")
-    X_test,  y_test  = load_svhn("./data/test_32x32.mat")
+    log("Preprocessing SVHN on GPU…")
+    X_train, y_train = load_svhn_preprocessed("./data/train_32x32.mat", device)
+    X_test,  y_test  = load_svhn_preprocessed("./data/test_32x32.mat", device)
 
     for alpha in DIR_ALPHAS:
 
@@ -247,28 +235,25 @@ def federated_run():
         global_model = ResNet18Pre(10).to(device)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
-        c_global = [torch.zeros_like(p).cpu() for p in trainable]
-        c_locals = [[torch.zeros_like(p).cpu() for p in trainable] for _ in range(NUM_CLIENTS)]
+        c_global = [torch.zeros_like(p) for p in trainable]
+        c_locals = [[torch.zeros_like(p) for p in trainable] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS+1):
-
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
-            global_start = [p.detach().clone().cpu() for p in trainable]
+            global_start = [p.detach().clone() for p in trainable]
 
             new_params_all = []
             delta_c_all = []
 
-            # sequential SCAFFOLD
             for cid in range(NUM_CLIENTS):
 
                 local_model = ResNet18Pre(10).to(device)
 
-                # load global start
                 with torch.no_grad():
                     j = 0
                     for p in local_model.parameters():
                         if p.requires_grad:
-                            p.copy_(global_start[j].to(device))
+                            p.copy_(global_start[j])
                             j += 1
 
                 new_params, dc, new_cl = run_client(
@@ -278,33 +263,31 @@ def federated_run():
                     y_train,
                     c_global,
                     c_locals[cid],
-                    lr,
-                    device
+                    lr
                 )
 
                 c_locals[cid] = new_cl
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # aggregate parameters
+            # aggregate
             avg_params = []
             for i in range(len(trainable)):
-                stack = torch.stack([cp[i] for cp in new_params_all], dim=0)
+                stack = torch.stack([cp[i] for cp in new_params_all])
                 avg_params.append(stack.mean(0))
 
-            # apply to global model
             with torch.no_grad():
                 j = 0
                 for p in global_model.parameters():
                     if p.requires_grad:
-                        p.copy_(avg_params[j].to(device))
+                        p.copy_(avg_params[j])
                         j += 1
 
-            # update c_global
+            # update global c
             for i in range(len(c_global)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
-            # evaluate
+            # eval
             acc = evaluate(global_model, X_test, y_test)
             log(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
