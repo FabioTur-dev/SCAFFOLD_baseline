@@ -21,19 +21,19 @@ NUM_ROUNDS = 30
 LOCAL_EPOCHS = 1
 BATCH = 128
 
-# LR stabile per α=0.05
-LR_INIT = 0.006
+# BEST hyperparameters (versione aggressiva che ha raggiunto 76%)
+LR_INIT = 0.01
 LR_DECAY_ROUND = 15
-LR_DECAY = 0.002
+LR_DECAY = 0.0015
 
-# SCAFFOLD meno aggressivo
-BETA = 0.005
-DAMPING = 0.05
+# BEST SCAFFOLD corrections
+BETA = 0.01
+DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
 
-# NUOVA RISOLUZIONE
-IMG_SIZE = 128
+# BEST resolution for SVHN+ResNet18
+IMG_SIZE = 160
 
 
 def set_seed(s):
@@ -69,7 +69,8 @@ def load_svhn_raw(path):
     y[y == 10] = 0
     y = y.astype(np.int64)
 
-    X = np.transpose(X, (3, 2, 0, 1))  # -> (N,3,32,32)
+    # Convert (32,32,3,N) -> (N,3,32,32)
+    X = np.transpose(X, (3, 2, 0, 1))
 
     X_t = torch.from_numpy(X).to(torch.uint8)
     y_t = torch.from_numpy(y).long()
@@ -103,7 +104,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================
-# RESNET18 – unlock only layer3, layer4, fc
+# RESNET18 – unlock layer2, layer3, layer4, fc
 # ======================================================
 
 class ResNet18Pre(nn.Module):
@@ -117,6 +118,7 @@ class ResNet18Pre(nn.Module):
             except:
                 self.m = models.resnet18()
 
+        # replace head
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
@@ -124,9 +126,14 @@ class ResNet18Pre(nn.Module):
         for p in self.m.parameters():
             p.requires_grad = False
 
-        # unfreeze 3–4–fc
+        # UNLOCK layer2, layer3, layer4, fc
         for name, p in self.m.named_parameters():
-            if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
+            if (
+                name.startswith("layer2") or
+                name.startswith("layer3") or
+                name.startswith("layer4") or
+                name.startswith("fc")
+            ):
                 p.requires_grad = True
 
     def forward(self, x):
@@ -134,7 +141,7 @@ class ResNet18Pre(nn.Module):
 
 
 # ======================================================
-# LOCAL TRAINING (resize per batch)
+# LOCAL TRAINING (SCAFFOLD + resize per batch)
 # ======================================================
 
 def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
@@ -146,15 +153,15 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
     opt = optim.SGD(train_params, lr=lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-    std  = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
 
     for _ in range(LOCAL_EPOCHS):
         for start in range(0, len(idxs), BATCH):
             batch_idx = idxs[start:start+BATCH]
 
             xb_u8 = X_cpu_u8[batch_idx]
-            yb    = y_cpu[batch_idx].to(device)
+            yb = y_cpu[batch_idx].to(device)
 
             xb = xb_u8.to(device, dtype=torch.float32) / 255.0
             xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
@@ -195,8 +202,8 @@ def evaluate(model, X_cpu_u8, y_cpu, device):
     correct = 0
     tot = len(y_cpu)
 
-    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-    std  = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+    mean = torch.tensor([0.485,0.456,0.406], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.229,0.224,0.225], device=device).view(1,3,1,1)
 
     with torch.no_grad():
         for start in range(0, tot, 256):
@@ -250,7 +257,7 @@ def federated_run():
                     j = 0
                     for p in local_model.parameters():
                         if p.requires_grad:
-                            p.copy_(gs[j]); j+=1
+                            p.copy_(gs[j]); j += 1
 
                 new_params, dc, new_local = run_client(
                     local_model,
@@ -267,7 +274,7 @@ def federated_run():
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # param avg
+            # PARAM AVG
             avg_params = []
             for i in range(len(train_params)):
                 avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
@@ -278,7 +285,7 @@ def federated_run():
                     if p.requires_grad:
                         p.copy_(avg_params[j]); j += 1
 
-            # c_global avg
+            # C_GLOBAL UPDATE
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
