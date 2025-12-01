@@ -16,7 +16,7 @@ from torchvision import models
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5]
 NUM_ROUNDS = 30
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = 3
 BATCH = 128
 
 LR_INIT = 0.01
