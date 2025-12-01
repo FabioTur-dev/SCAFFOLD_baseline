@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torchvision import datasets, models, transforms
+from torchvision import datasets, models
 
 
 # ======================================================
@@ -24,14 +24,14 @@ LR_INIT = 0.01
 LR_DECAY_ROUND = 15
 LR_DECAY = 0.003
 
-# SCAFFOLD – version "moderate"
+# SCAFFOLD – moderate (fix per CIFAR-100)
 BETA = 0.003
 DAMPING = 0.03
 GRAD_CLIP = 5.0
 
 SEED = 42
 
-# CIFAR-100 → molto meglio 64x64 che 160x160
+# CIFAR-100 → 64x64 è l'optimum
 IMG_SIZE = 64
 
 
@@ -47,7 +47,7 @@ def log(x):
 
 
 # ======================================================
-# GPU AUGMENT (leggero)
+# GPU AUGMENT
 # ======================================================
 
 def gpu_augment(x):
@@ -83,16 +83,17 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================
-# RESNET18 – sblocca layer2,3,4,fc
+# RESNET18 — sblocca layer2–3–4 + fc
 # ======================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
 
+        # compatibilità
         try:
             self.m = models.resnet18(weights="IMAGENET1K_V1")
-        except Exception:
+        except:
             try:
                 self.m = models.resnet18(pretrained=True)
             except:
@@ -101,11 +102,11 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # Freeze everything
+        # Freeze all layers
         for p in self.m.parameters():
             p.requires_grad = False
 
-        # Unlock recommended blocks for CIFAR-100 finetuning
+        # Unlock specific blocks
         for name, p in self.m.named_parameters():
             if (
                 name.startswith("layer2")
@@ -120,7 +121,20 @@ class ResNet18Pre(nn.Module):
 
 
 # ======================================================
-# LOCAL TRAINING – SCAFFOLD
+# FIX FONDAMENTALE → copia pesi by-name
+# ======================================================
+
+def load_weights_by_name(target, source):
+    sd_t = target.state_dict()
+    sd_s = source.state_dict()
+
+    for k in sd_t:
+        if k in sd_s and sd_t[k].shape == sd_s[k].shape:
+            sd_t[k].copy_(sd_s[k])
+
+
+# ======================================================
+# LOCAL TRAINING (SCAFFOLD)
 # ======================================================
 
 def run_client(model, idxs, X, y, c_global, c_local, lr, device):
@@ -151,13 +165,13 @@ def run_client(model, idxs, X, y, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
+            # SCAFFOLD correction
             for i, p in enumerate(train_params):
                 p.grad += DAMPING * (c_global[i] - c_local[i])
 
             torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
             opt.step()
 
-    # Update c_local
     new_params = [p.detach().clone() for p in train_params]
     delta_c = []
     E = max(1, len(idxs) // BATCH)
@@ -180,8 +194,8 @@ def evaluate(model, X, y, device):
     correct = 0
     tot = len(y)
 
-    mean = torch.tensor([0.5,0.5,0.5], device=device).view(1,3,1,1)
-    std = torch.tensor([0.5,0.5,0.5], device=device).view(1,3,1,1)
+    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1,3,1,1)
+    std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1,3,1,1)
 
     with torch.no_grad():
         for start in range(0, tot, 256):
@@ -225,9 +239,8 @@ def federated_run():
         c_global = [torch.zeros_like(p) for p in train_params]
         c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
-        for rnd in range(1, NUM_ROUNDS+1):
+        for rnd in range(1, NUM_ROUNDS + 1):
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
-            gs = [p.detach().clone() for p in train_params]
 
             new_params_all = []
             delta_c_all = []
@@ -235,12 +248,9 @@ def federated_run():
             for cid in range(NUM_CLIENTS):
                 local = ResNet18Pre(100).to(device)
 
+                # FIX COPIA SICURA BY-NAME
                 with torch.no_grad():
-                    j = 0
-                    for p in local.parameters():
-                        if p.requires_grad:
-                            p.copy_(gs[j])
-                            j += 1
+                    load_weights_by_name(local, global_model)
 
                 newp, dc, newcl = run_client(
                     local, splits[cid], X_train, y_train,
@@ -251,6 +261,7 @@ def federated_run():
                 new_params_all.append(newp)
                 delta_c_all.append(dc)
 
+            # AGGREGATE NEW PARAMS
             avg_params = []
             for i in range(len(train_params)):
                 avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
@@ -262,6 +273,7 @@ def federated_run():
                         p.copy_(avg_params[j])
                         j += 1
 
+            # AGGIORNA C_GLOBAL
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
