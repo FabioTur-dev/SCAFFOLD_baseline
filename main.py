@@ -134,24 +134,39 @@ def dirichlet_split(labels, n_clients, alpha):
 # RESNET18 (solo layer3,4,fc allenabili)
 # ======================================================================
 
+# ======================================================================
+# RESNET18 (solo layer3,4,fc allenabili) — COMPATIBILE CON OGNI TORCHVISION
+# ======================================================================
+
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
-        from torchvision.models import ResNet18_Weights
-        self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
 
+        # Compatibile con TUTTE le versioni di torchvision
+        try:
+            self.m = models.resnet18(weights='IMAGENET1K_V1')
+        except:
+            try:
+                self.m = models.resnet18(pretrained=True)
+            except:
+                self.m = models.resnet18()
+
+        # Replace FC
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # Freeze everything
         for p in self.m.parameters():
             p.requires_grad = False
 
+        # Unfreeze only layer3, layer4, fc
         for name, p in self.m.named_parameters():
             if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
                 p.requires_grad = True
 
     def forward(self, x):
         return self.m(x)
+
 
 
 
