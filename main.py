@@ -247,6 +247,9 @@ def federated_run():
     train_X, train_y = load_svhn_split("train")
     test_X, test_y = load_svhn_split("test")
 
+    train_y = train_y.astype(np.int64)
+    test_y = test_y.astype(np.int64)
+
     labels_np = train_y
     data_np = train_X
 
