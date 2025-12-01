@@ -21,7 +21,7 @@ from torchvision.transforms.functional import to_pil_image
 # ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.05, 0.5]   # <<< AGGIORNATO
+DIR_ALPHAS = [0.05, 0.5]      # SVHN splits
 NUM_ROUNDS = 50
 LOCAL_EPOCHS = 1
 BATCH = 128
@@ -51,7 +51,7 @@ def log(msg):
 
 
 # ==============================================================
-# DATASET WRAPPER – Resize 160×160
+# DATASET WRAPPER – Resize 160×160, nessun errore di canali
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -82,9 +82,8 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img_np = self.data[idx]   # shape [32,32,3], valid
+        img_np = self.data[idx]      # shape [32,32,3]
         label = self.labels[idx]
-
         img = self.T(img_np)
         return img, label
 
@@ -116,12 +115,13 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ==============================================================
-# MODEL – RESNET18
+# MODEL – RESNET18 (solo layer3, layer4 e fc trainabili)
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
+
         try:
             from torchvision.models import ResNet18_Weights
             self.m = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
@@ -131,18 +131,21 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
+        # FREEZE EVERYTHING
+        for p in self.m.parameters():
+            p.requires_grad = False
+
+        # UNFREEZE ONLY layer3, layer4, fc
         for name, p in self.m.named_parameters():
-            if ("layer3" in name) or ("layer4" in name) or ("fc" in name):
+            if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
                 p.requires_grad = True
-            else:
-                p.requires_grad = False
 
     def forward(self, x):
         return self.m(x)
 
 
 # ==============================================================
-# LOCAL TRAINING (SCAFFOLD CLIENT)
+# LOCAL CLIENT TRAINING – SCAFFOLD
 # ==============================================================
 
 def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
@@ -166,12 +169,14 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
+            # SCAFFOLD correction
             for i, p in enumerate(trainable):
                 p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
 
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
 
+    # Compute deltas
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
 
@@ -185,65 +190,91 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
 
 
 # ==============================================================
-# GLOBAL EVAL
+# GLOBAL EVALUATION
 # ==============================================================
 
 def evaluate(model, loader, device):
     model.eval()
-    c = 0
-    tot = 0
+    correct = 0
+    total = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             pred = model(x).argmax(1)
-            c += (pred == y).sum().item()
-            tot += y.size(0)
-    return c / tot
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return correct / total
 
 
 # ==============================================================
-# FEDERATED LOOP (SEQUENTIAL)
+# FEDERATED LOOP
 # ==============================================================
 
 def federated_run(ds_name):
 
     device = "cuda:0"
 
-    # Load SVHN
     if ds_name == "SVHN":
         tr = datasets.SVHN("./data", split="train", download=True)
-        data = torch.tensor(tr.data).permute(0, 2, 3, 1)   # [N,H,W,C] → same shape
-        labels = torch.tensor(tr.labels)
-        nc = 10
-    else:
-        raise ValueError("Only SVHN supported now")
 
-    # Test loader (Resize 160)
+        # ==== FIX FINALE PER SVHN ====
+        data_np = tr.data
+        if data_np.ndim == 4 and data_np.shape[0] == 3:
+            # (3,32,32,N) -> (N,32,32,3)
+            data_np = np.transpose(data_np, (3, 1, 2, 0))
+
+        data = data_np
+        labels = np.array(tr.labels)
+        nc = 10
+
+    else:
+        raise ValueError("Only SVHN supported")
+
+    # ==== TEST SET ====
+    te = datasets.SVHN("./data", split="test", download=True)
+    test_np = te.data
+    if test_np.ndim == 4 and test_np.shape[0] == 3:
+        test_np = np.transpose(test_np, (3, 1, 2, 0))
+
     transform_test = transforms.Compose([
+        transforms.ToPILImage(),
         transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225))
     ])
-    te = datasets.SVHN("./data", split="test", download=True, transform=transform_test)
-    testloader = DataLoader(te, batch_size=256, shuffle=False)
 
-    labels_np = labels.numpy()
+    class SVHNTestWrapper(Dataset):
+        def __init__(self, data, labels):
+            self.data = data
+            self.labels = labels
+
+        def __len__(self):
+            return len(self.labels)
+
+        def __getitem__(self, i):
+            img = self.data[i]
+            img = transform_test(img)
+            return img, self.labels[i]
+
+    testloader = DataLoader(SVHNTestWrapper(test_np, te.labels),
+                            batch_size=256, shuffle=False)
+
+    # ==========================================================
+    #              FEDERATED TRAINING ROUNDS
+    # ==========================================================
 
     for alpha in DIR_ALPHAS:
 
         log(f"\n==== DATASET={ds_name} | α={alpha} ====\n")
 
-        splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
+        splits = dirichlet_split(labels, NUM_CLIENTS, alpha)
 
         global_model = ResNet18Pre(nc).to(device)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
-        c_locals = [
-            [torch.zeros_like(p).cpu() for p in trainable]
-            for _ in range(NUM_CLIENTS)
-        ]
+        c_locals = [[torch.zeros_like(p).cpu() for p in trainable] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS + 1):
 
@@ -268,8 +299,10 @@ def federated_run(ds_name):
                 new_params, delta_c, new_c_local = run_client(
                     local_model,
                     splits[cid],
-                    data, labels,
-                    c_global, c_locals[cid],
+                    data,
+                    labels,
+                    c_global,
+                    c_locals[cid],
                     lr,
                     device
                 )
@@ -280,15 +313,15 @@ def federated_run(ds_name):
 
             avg_params = []
             for i in range(len(trainable)):
-                stacked = torch.stack([client_params[i] for client_params in new_params_all], dim=0)
+                stacked = torch.stack([cp[i] for cp in new_params_all], dim=0)
                 avg_params.append(stacked.mean(0))
 
             with torch.no_grad():
-                idx = 0
+                idx=0
                 for p in global_model.parameters():
                     if p.requires_grad:
                         p.copy_(avg_params[idx].to(device))
-                        idx += 1
+                        idx+=1
 
             for i in range(len(c_global)):
                 stacked = torch.stack([dc[i] for dc in delta_c_all], dim=0)
@@ -296,6 +329,7 @@ def federated_run(ds_name):
 
             acc = evaluate(global_model, testloader, device)
             log(f"[ROUND {rnd}] ACC={acc*100:.2f}%")
+
 
 
 # ==============================================================
