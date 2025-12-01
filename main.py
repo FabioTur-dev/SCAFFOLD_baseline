@@ -12,28 +12,26 @@ from torchvision import models
 
 
 # ======================================================
-# CONFIG
+# CONFIG – tuned for 80%+ stability on SVHN α = 0.5
 # ======================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5, 0.05]
+DIR_ALPHAS = [0.5]
 NUM_ROUNDS = 30
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = 2
 BATCH = 128
 
-# BEST hyperparameters (versione aggressiva che ha raggiunto 76%)
 LR_INIT = 0.01
 LR_DECAY_ROUND = 15
 LR_DECAY = 0.0015
 
-# BEST SCAFFOLD corrections
 BETA = 0.01
-DAMPING = 0.1
+DAMPING = 0.05     # meno aggressivo → più stabile in fine training
 GRAD_CLIP = 5.0
 SEED = 42
 
-# BEST resolution for SVHN+ResNet18
-IMG_SIZE = 160
+IMG_SIZE = 160     # best resolution
+EMA_DECAY = 0.995  # GLOBAL EMA (stabilizza tutto)
 
 
 def set_seed(s):
@@ -58,19 +56,18 @@ def gpu_augment(x):
 
 
 # ======================================================
-# LOAD SVHN RAW (NO CV2, NO PIL)
+# LOAD SVHN RAW
 # ======================================================
 
 def load_svhn_raw(path):
     mat = sio.loadmat(path)
-    X = mat["X"]              # (32,32,3,N)
+    X = mat["X"]           # (32, 32, 3, N)
     y = mat["y"].squeeze()
 
     y[y == 10] = 0
     y = y.astype(np.int64)
 
-    # Convert (32,32,3,N) -> (N,3,32,32)
-    X = np.transpose(X, (3, 2, 0, 1))
+    X = np.transpose(X, (3, 2, 0, 1))   # -> (N,3,32,32)
 
     X_t = torch.from_numpy(X).to(torch.uint8)
     y_t = torch.from_numpy(y).long()
@@ -104,12 +101,13 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================
-# RESNET18 – unlock layer2, layer3, layer4, fc
+# RESNET18 – unlock ALL feature blocks (layer1-4)
 # ======================================================
 
 class ResNet18Pre(nn.Module):
     def __init__(self, nc):
         super().__init__()
+
         try:
             self.m = models.resnet18(weights="IMAGENET1K_V1")
         except:
@@ -118,30 +116,19 @@ class ResNet18Pre(nn.Module):
             except:
                 self.m = models.resnet18()
 
-        # replace head
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # freeze all
-        for p in self.m.parameters():
-            p.requires_grad = False
-
-        # UNLOCK layer2, layer3, layer4, fc
+        # Free all layers (SVHN needs full adaptation)
         for name, p in self.m.named_parameters():
-            if (
-                name.startswith("layer2") or
-                name.startswith("layer3") or
-                name.startswith("layer4") or
-                name.startswith("fc")
-            ):
-                p.requires_grad = True
+            p.requires_grad = True
 
     def forward(self, x):
         return self.m(x)
 
 
 # ======================================================
-# LOCAL TRAINING (SCAFFOLD + resize per batch)
+# LOCAL CLIENT TRAINING (WITH SCAFFOLD)
 # ======================================================
 
 def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
@@ -153,8 +140,8 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
     opt = optim.SGD(train_params, lr=lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+    mean = torch.tensor([0.485,0.456,0.406], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.229,0.224,0.225], device=device).view(1,3,1,1)
 
     for _ in range(LOCAL_EPOCHS):
         for start in range(0, len(idxs), BATCH):
@@ -166,7 +153,6 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
             xb = xb_u8.to(device, dtype=torch.float32) / 255.0
             xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
             xb = (xb - mean) / std
-
             xb = gpu_augment(xb)
 
             opt.zero_grad()
@@ -174,12 +160,14 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
+            # SCAFFOLD correction
             for i, p in enumerate(train_params):
                 p.grad += DAMPING * (c_global[i] - c_local[i])
 
             torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
             opt.step()
 
+    # compute deltas
     new_params = [p.detach().clone() for p in train_params]
     delta_c = []
 
@@ -194,10 +182,21 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
 
 
 # ======================================================
-# EVAL
+# GLOBAL EMA
+# ======================================================
+
+def ema_update(model, ema_model, decay=EMA_DECAY):
+    with torch.no_grad():
+        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+            p_ema.mul_(decay).add_(p, alpha=(1 - decay))
+
+
+# ======================================================
+# EVAL (always on EMA model)
 # ======================================================
 
 def evaluate(model, X_cpu_u8, y_cpu, device):
+
     model.eval()
     correct = 0
     tot = len(y_cpu)
@@ -238,12 +237,19 @@ def federated_run():
         splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
 
         global_model = ResNet18Pre(10).to(device)
+
+        # EMA MODEL
+        ema_model = ResNet18Pre(10).to(device)
+        ema_model.load_state_dict(global_model.state_dict())
+
         train_params = [p for p in global_model.parameters() if p.requires_grad]
 
         c_global = [torch.zeros_like(p) for p in train_params]
-        c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
+        c_locals = [[torch.zeros_like(p) for p in train_params]
+                    for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS+1):
+
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
             gs = [p.detach().clone() for p in train_params]
 
@@ -251,6 +257,7 @@ def federated_run():
             delta_c_all = []
 
             for cid in range(NUM_CLIENTS):
+
                 local_model = ResNet18Pre(10).to(device)
 
                 with torch.no_grad():
@@ -285,11 +292,15 @@ def federated_run():
                     if p.requires_grad:
                         p.copy_(avg_params[j]); j += 1
 
-            # C_GLOBAL UPDATE
+            # C_GLOBAL
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
-            acc = evaluate(global_model, X_test, y_test, device)
+            # EMA UPDATE
+            ema_update(global_model, ema_model)
+
+            # EVAL ALWAYS ON EMA
+            acc = evaluate(ema_model, X_test, y_test, device)
             log(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
 
