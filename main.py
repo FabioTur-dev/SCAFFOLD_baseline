@@ -1,323 +1,293 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, random, numpy as np, scipy.io as sio, torch
+import random
+import numpy as np
+import scipy.io as sio
+import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
 
-
-# ==============================================================
+# ======================================================
 # CONFIG
-# ==============================================================
+# ======================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.5]
-NUM_ROUNDS = 50
-LOCAL_EPOCHS = 2
+DIR_ALPHAS = [0.05, 0.5]
+NUM_ROUNDS = 30
+LOCAL_EPOCHS = 1
 BATCH = 128
 
-BASE_LR = 0.01
-LR_LAYER1 = BASE_LR * 0.01
-LR_LAYER2 = BASE_LR * 0.10
-LR_FINAL   = BASE_LR
+LR_INIT = 0.02
+LR_DECAY_ROUND = 15
+LR_DECAY = 0.002
 
 BETA = 0.01
-DAMPING = 0.05
+DAMPING = 0.1
 GRAD_CLIP = 5.0
-IMG_SIZE = 160
 SEED = 42
+
+IMG_SIZE = 32   # SVHN native
 
 
 def set_seed(s):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+    torch.cuda.manual_seed_all(s)
 
 
-def log(x): print(x, flush=True)
+def log(x):
+    print(x, flush=True)
 
 
+# ======================================================
+# SMALL RESNET FOR 32x32 SVHN
+# ======================================================
 
-# ==============================================================
-# LOAD SVHN (SAFE)
-# ==============================================================
+class BasicBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
 
-def load_svhn_cpu(path):
-    d = sio.loadmat(path)
+        self.short = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.short = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
 
-    X = d["X"]      # (32,32,3,N)
-    y = d["y"].reshape(-1)
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.short(x)
+        return F.relu(out)
 
-    # -> (N,3,32,32)
-    X = np.transpose(X, (3, 2, 0, 1))
-    X = torch.tensor(X, dtype=torch.float32) / 255.0
-    y = torch.tensor(y, dtype=torch.long)
+
+class SmallResNet32(nn.Module):
+    # 3-stage ResNet-like for SVHN (≈3M params)
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 32, 3, 1, 1, bias=False)
+        self.bn = nn.BatchNorm2d(32)
+
+        self.layer1 = nn.Sequential(
+            BasicBlock(32, 32),
+            BasicBlock(32, 32)
+        )
+        self.layer2 = nn.Sequential(
+            BasicBlock(32, 64, stride=2),
+            BasicBlock(64, 64)
+        )
+        self.layer3 = nn.Sequential(
+            BasicBlock(64, 128, stride=2),
+            BasicBlock(128, 128)
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.bn(self.conv(x)))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.pool(x).flatten(1)
+        return self.fc(x)
+
+
+# ======================================================
+# GPU AUGMENT (light)
+# ======================================================
+
+def gpu_augment(x):
+    if torch.rand(1) < 0.5:
+        x = torch.flip(x, dims=[3])
+    if torch.rand(1) < 0.3:
+        x = x + 0.05 * torch.randn_like(x)
+    return torch.clamp(x, 0, 1)
+
+
+# ======================================================
+# LOAD SVHN RAW
+# ======================================================
+
+def load_svhn_raw(path):
+    mat = sio.loadmat(path)
+    X = mat["X"]              # (32,32,3,N)
+    y = mat["y"].squeeze()
     y[y == 10] = 0
-
-    return X, y
-
-
-
-# ==============================================================
-# DATASET FIXATO (definitivo)
-# ==============================================================
-
-class RawDataset(Dataset):
-    def __init__(self, X, y, idx):
-        self.X = X
-        self.y = y
-        self.idx = idx
-
-        self.T = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize(IMG_SIZE),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(IMG_SIZE, padding=8),
-            transforms.ToTensor(),
-        ])
-
-    def __len__(self): return len(self.idx)
-
-    def __getitem__(self, i):
-        k = self.idx[i]
-        img = self.X[k]
-
-        # safety: ensure CHW
-        if img.dim() == 4:
-            img = img.squeeze()
-        if img.shape[0] != 3 and img.shape[-1] == 3:
-            img = img.permute(2, 0, 1)
-
-        img = self.T(img)
-        return img, self.y[k]
+    y = y.astype(np.int64)
+    X = np.transpose(X, (3, 2, 0, 1))
+    return torch.from_numpy(X).to(torch.uint8), torch.from_numpy(y).long()
 
 
-
-# ==============================================================
+# ======================================================
 # DIRICHLET SPLIT
-# ==============================================================
+# ======================================================
 
 def dirichlet_split(labels, n_clients, alpha):
-    labels = labels.numpy()
-    cls = np.unique(labels)
-    split = [[] for _ in range(n_clients)]
+    labels_np = labels.numpy()
+    per = [[] for _ in range(n_clients)]
+    classes = np.unique(labels_np)
 
-    for c in cls:
-        idx = np.where(labels == c)[0]
+    for c in classes:
+        idx = np.where(labels_np == c)[0]
         np.random.shuffle(idx)
-        p = np.random.dirichlet([alpha]*n_clients)
-        cuts = (np.cumsum(p)*len(idx)).astype(int)
+        p = np.random.dirichlet([alpha] * n_clients)
+        cuts = (np.cumsum(p) * len(idx)).astype(int)
         chunks = np.split(idx, cuts[:-1])
-        for i in range(n_clients):
-            split[i].extend(chunks[i])
+        for cid in range(n_clients):
+            per[cid].extend(chunks[cid])
 
-    for s in split: random.shuffle(s)
-    return split
+    for cid in range(n_clients):
+        if len(per[cid]) == 0:
+            per[cid].append(np.random.randint(0, len(labels_np)))
+        random.shuffle(per[cid])
 
-
-
-# ==============================================================
-# MODEL (LR MULTISCALE / BN trainabile)
-# ==============================================================
-
-class ResNet18Pre(nn.Module):
-    def __init__(self, nc=10):
-        super().__init__()
-        self.m = models.resnet18(pretrained=True)
-
-        in_f = self.m.fc.in_features
-        self.m.fc = nn.Linear(in_f, nc)
-
-        self.param_groups = {
-            "layer1": [], "layer2": [],
-            "layer3": [], "layer4": [], "fc": []
-        }
-
-        for name, p in self.m.named_parameters():
-            if "layer1" in name:
-                self.param_groups["layer1"].append(p)
-            elif "layer2" in name:
-                self.param_groups["layer2"].append(p)
-            elif "layer3" in name:
-                self.param_groups["layer3"].append(p)
-            elif "layer4" in name:
-                self.param_groups["layer4"].append(p)
-            else:
-                self.param_groups["fc"].append(p)
-
-    def get_optimizer(self):
-        return optim.SGD([
-            {"params": self.param_groups["layer1"], "lr": LR_LAYER1},
-            {"params": self.param_groups["layer2"], "lr": LR_LAYER2},
-            {"params": self.param_groups["layer3"], "lr": LR_FINAL},
-            {"params": self.param_groups["layer4"], "lr": LR_FINAL},
-            {"params": self.param_groups["fc"],     "lr": LR_FINAL},
-        ], momentum=0.9, weight_decay=5e-4)
-
-    def forward(self, x): return self.m(x)
+    return per
 
 
-
-# ==============================================================
+# ======================================================
 # LOCAL TRAINING
-# ==============================================================
+# ======================================================
 
-def run_client(model, idxs, X, y, c_global, c_local, device, rnd):
-    ds = RawDataset(X, y, idxs)
-    loader = DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=2)
+def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
+    model.train()
+    train_params = [p for p in model.parameters() if p.requires_grad]
+    old_params = [p.detach().clone() for p in train_params]
 
-    opt = model.get_optimizer()
-    ce = nn.CrossEntropyLoss()
+    opt = optim.SGD(train_params, lr=lr, momentum=0.9)
+    loss_fn = nn.CrossEntropyLoss()
 
-    params = [p for p in model.parameters()]
-    old = [p.detach().clone().cpu() for p in params]
+    # SVHN mean/std
+    mean = torch.tensor([0.4377, 0.4438, 0.4728], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.1980, 0.2010, 0.1970], device=device).view(1,3,1,1)
 
-    freeze_l1 = (rnd <= 2)
+    for _ in range(LOCAL_EPOCHS):
+        for start in range(0, len(idxs), BATCH):
+            b = idxs[start:start+BATCH]
+            xb = X_cpu_u8[b].to(device, dtype=torch.float32) / 255.0
+            yb = y_cpu[b].to(device)
 
-    # Map param index → name
-    param_names = [n for (n, _) in model.m.named_parameters()]
-
-    for ep in range(LOCAL_EPOCHS):
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb = (xb - mean) / std
+            xb = gpu_augment(xb)
 
             opt.zero_grad()
             out = model(xb)
-            loss = ce(out, yb)
+            loss = loss_fn(out, yb)
             loss.backward()
 
-            for i, p in enumerate(params):
-                name = param_names[i]
+            for i, p in enumerate(train_params):
+                p.grad += DAMPING * (c_global[i] - c_local[i])
 
-                # warmup
-                if freeze_l1 and "layer1" in name:
-                    p.grad.zero_()
-                    continue
-
-                p.grad += DAMPING * (c_global[i].to(device) - c_local[i].to(device))
-
-            torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
             opt.step()
 
-    new = [p.detach().clone().cpu() for p in params]
-
+    new_params = [p.detach().clone() for p in train_params]
     delta_c = []
-    for i in range(len(params)):
-        diff = new[i] - old[i]
-        dc = BETA * diff
+
+    E = max(1, len(idxs)//BATCH)
+    for i in range(len(train_params)):
+        diff = new_params[i] - old_params[i]
+        dc = BETA * (diff / E)
         delta_c.append(dc)
         c_local[i] += dc
 
-    return new, delta_c, c_local
+    return new_params, delta_c, c_local
 
 
-
-# ==============================================================
+# ======================================================
 # EVAL
-# ==============================================================
+# ======================================================
 
-def evaluate(model, Xte, Yte, device):
-    Ttest = transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize(IMG_SIZE),
-        transforms.ToTensor()
-    ])
-
-    class TestDS(Dataset):
-        def __len__(self): return len(Xte)
-        def __getitem__(self, i):
-            img = Xte[i]
-            if img.dim() == 4: img = img.squeeze()
-            if img.shape[0] != 3 and img.shape[-1] == 3:
-                img = img.permute(2,0,1)
-            img = Ttest(img)
-            return img, Yte[i]
-
-    loader = DataLoader(TestDS(), batch_size=256, shuffle=False)
-
+def evaluate(model, X_cpu_u8, y_cpu, device):
     model.eval()
-    c = 0
-    t = 0
+    correct = 0
+    tot = len(y_cpu)
+
+    mean = torch.tensor([0.4377, 0.4438, 0.4728], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.1980, 0.2010, 0.1970], device=device).view(1,3,1,1)
+
     with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
+        for start in range(0, tot, 256):
+            xb = X_cpu_u8[start:start+256].to(device, dtype=torch.float32) / 255.0
+            yb = y_cpu[start:start+256].to(device)
+            xb = (xb - mean) / std
             pred = model(xb).argmax(1)
-            c += (pred == yb).sum().item()
-            t += yb.size(0)
-    return c/t
+            correct += (pred == yb).sum().item()
+
+    return correct / tot
 
 
-
-# ==============================================================
+# ======================================================
 # FEDERATED LOOP
-# ==============================================================
+# ======================================================
 
 def federated_run():
-    device = "cuda"
+    device = "cuda:0"
 
-    log("Carico SVHN (CPU, 32x32)...")
-    Xtr, Ytr = load_svhn_cpu("./data/train_32x32.mat")
-    Xte, Yte = load_svhn_cpu("./data/test_32x32.mat")
+    log("Carico SVHN...")
+    X_train, y_train = load_svhn_raw("./data/train_32x32.mat")
+    X_test, y_test   = load_svhn_raw("./data/test_32x32.mat")
 
     for alpha in DIR_ALPHAS:
         log(f"\n==== SVHN | α={alpha} ====\n")
 
-        splits = dirichlet_split(Ytr, NUM_CLIENTS, alpha)
+        splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
 
-        global_model = ResNet18Pre(10).to(device)
-        params = [p for p in global_model.parameters()]
+        global_model = SmallResNet32(10).to(device)
+        train_params = [p for p in global_model.parameters() if p.requires_grad]
 
-        c_global = [torch.zeros_like(p).cpu() for p in params]
-        c_locals = [[torch.zeros_like(p).cpu() for p in params] for _ in range(NUM_CLIENTS)]
+        c_global = [torch.zeros_like(p) for p in train_params]
+        c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS+1):
+            lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
+            gs = [p.detach().clone() for p in train_params]
 
-            new_all = []
-            dc_all = []
+            new_params_all = []
+            delta_c_all = []
 
             for cid in range(NUM_CLIENTS):
+                local_model = SmallResNet32(10).to(device)
 
-                # clone weights
-                local = ResNet18Pre(10).to(device)
-                j = 0
-                for p in local.parameters():
-                    p.data.copy_(params[j].data)
-                    j += 1
+                with torch.no_grad():
+                    j=0
+                    for p in local_model.parameters():
+                        if p.requires_grad:
+                            p.copy_(gs[j]); j+=1
 
-                newp, dc, newcl = run_client(
-                    local, splits[cid], Xtr, Ytr,
-                    c_global, c_locals[cid],
-                    device, rnd
+                new_params, dc, new_local = run_client(
+                    local_model, splits[cid], X_train, y_train,
+                    c_global, c_locals[cid], lr, device
                 )
 
-                new_all.append(newp)
-                dc_all.append(dc)
-                c_locals[cid] = newcl
+                c_locals[cid] = new_local
+                new_params_all.append(new_params)
+                delta_c_all.append(dc)
 
-            avg = []
-            for i in range(len(params)):
-                avg.append(torch.stack([cl[i] for cl in new_all]).mean(0))
+            avg_params = []
+            for i in range(len(train_params)):
+                avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
 
             with torch.no_grad():
-                for i, p in enumerate(params):
-                    p.copy_(avg[i].to(device))
+                j = 0
+                for p in global_model.parameters():
+                    if p.requires_grad:
+                        p.copy_(avg_params[j]); j+=1
 
-            for i in range(len(c_global)):
-                c_global[i] = torch.stack([dc[i] for dc in dc_all]).mean(0)
+            for i in range(len(train_params)):
+                c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
-            acc = evaluate(global_model, Xte, Yte, device)
+            acc = evaluate(global_model, X_test, y_test, device)
             log(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
-
-# ==============================================================
-# MAIN
-# ==============================================================
 
 def main():
     set_seed(SEED)
