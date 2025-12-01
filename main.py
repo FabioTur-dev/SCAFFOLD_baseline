@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torchvision import models
 
 # ======================================================
 # CONFIG
@@ -18,16 +19,16 @@ NUM_ROUNDS = 30
 LOCAL_EPOCHS = 1
 BATCH = 128
 
-# BEST hyperparameters (dalla tua versione)
 LR_INIT = 0.01
 LR_DECAY_ROUND = 15
 LR_DECAY = 0.0015
 
-# SCAFFOLD
 BETA = 0.01
 DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
+
+IMG_SIZE = 64   # molto meglio per SVHN
 
 def set_seed(s):
     random.seed(s)
@@ -39,18 +40,16 @@ def log(x):
     print(x, flush=True)
 
 # ======================================================
-# LOAD SVHN
+# LOAD SVHN RAW (NO PIL, NO CV2)
 # ======================================================
 def load_svhn_raw(path):
     mat = sio.loadmat(path)
-    X = mat["X"]          # (32,32,3,N)
+    X = mat["X"]              # (32,32,3,N)
     y = mat["y"].squeeze()
     y[y == 10] = 0
     y = y.astype(np.int64)
-    X = np.transpose(X, (3, 2, 0, 1))
-    X_t = torch.from_numpy(X).to(torch.uint8)
-    y_t = torch.from_numpy(y).long()
-    return X_t, y_t
+    X = np.transpose(X, (3, 2, 0, 1))   # -> (N,3,32,32)
+    return torch.from_numpy(X).to(torch.uint8), torch.from_numpy(y).long()
 
 # ======================================================
 # DIRICHLET SPLIT
@@ -77,63 +76,33 @@ def dirichlet_split(labels, n_clients, alpha):
     return per
 
 # ======================================================
-# MINI-RESNET SVHN-FRIENDLY (ResNet-20 style)
+# RESNET18 PRETRAINED — UNFREEZE layer1–4 + fc
 # ======================================================
-
-class BasicBlock(nn.Module):
-    def __init__(self, in_c, out_c, stride=1):
+class ResNet18SVHN(nn.Module):
+    def __init__(self, nc=10):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_c, out_c, 3, stride, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_c)
-        self.conv2 = nn.Conv2d(out_c, out_c, 3, 1, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_c)
+        try:
+            self.m = models.resnet18(weights="IMAGENET1K_V1")
+        except:
+            self.m = models.resnet18(pretrained=True)
 
-        self.shortcut = (
-            nn.Identity() if in_c == out_c and stride == 1
-            else nn.Sequential(
-                nn.Conv2d(in_c, out_c, 1, stride, bias=False),
-                nn.BatchNorm2d(out_c)
-            )
-        )
+        in_f = self.m.fc.in_features
+        self.m.fc = nn.Linear(in_f, nc)
+
+        # FREEZE ONLY conv1 + bn1
+        for name, p in self.m.named_parameters():
+            if name.startswith("conv1") or name.startswith("bn1"):
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
 
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        return F.relu(out)
-
-class MiniResNetSVHN(nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 16, 3, 1, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
-
-        self.layer1 = self._make_layer(16, 16, stride=1)
-        self.layer2 = self._make_layer(16, 32, stride=2)
-        self.layer3 = self._make_layer(32, 64, stride=2)
-
-        self.fc = nn.Linear(64, num_classes)
-
-    def _make_layer(self, in_c, out_c, stride):
-        return nn.Sequential(
-            BasicBlock(in_c, out_c, stride),
-            BasicBlock(out_c, out_c, 1)
-        )
-
-    def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = F.avg_pool2d(x, x.shape[-1])
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        return self.m(x)
 
 # ======================================================
 # LOCAL TRAINING
 # ======================================================
 def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
-
     model.train()
     train_params = [p for p in model.parameters() if p.requires_grad]
     old_params = [p.detach().clone() for p in train_params]
@@ -141,10 +110,17 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
     opt = optim.SGD(train_params, lr=lr, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
+    mean = torch.tensor([0.485,0.456,0.406], device=device).view(1,3,1,1)
+    std = torch.tensor([0.229,0.224,0.225], device=device).view(1,3,1,1)
+
     for _ in range(LOCAL_EPOCHS):
         for start in range(0, len(idxs), BATCH):
             b = idxs[start:start+BATCH]
+
             xb = X_cpu_u8[b].to(device, dtype=torch.float32) / 255.0
+            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
+            xb = (xb - mean) / std
+
             yb = y_cpu[b].to(device)
 
             opt.zero_grad()
@@ -173,15 +149,22 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
 # ======================================================
 # EVAL
 # ======================================================
-def evaluate(model, X_cpu_u8, y_cpu, device):
+def evaluate(model, X, y, device):
     model.eval()
     correct = 0
-    tot = len(y_cpu)
+    tot = len(y)
+
+    mean = torch.tensor([0.485,0.456,0.406], device=device).view(1,3,1,1)
+    std = torch.tensor([0.229,0.224,0.225], device=device).view(1,3,1,1)
 
     with torch.no_grad():
         for start in range(0, tot, 256):
-            xb = X_cpu_u8[start:start+256].to(device, dtype=torch.float32) / 255.0
-            yb = y_cpu[start:start+256].to(device)
+            xb = X[start:start+256].to(device, dtype=torch.float32) / 255.0
+            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
+            xb = (xb - mean) / std
+
+            yb = y[start:start+256].to(device)
+
             pred = model(xb).argmax(1)
             correct += (pred == yb).sum().item()
 
@@ -201,22 +184,22 @@ def federated_run():
         log(f"\n==== SVHN | α={alpha} ====\n")
 
         splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
-        global_model = MiniResNetSVHN(10).to(device)
 
+        global_model = ResNet18SVHN(10).to(device)
         train_params = [p for p in global_model.parameters() if p.requires_grad]
+
         c_global = [torch.zeros_like(p) for p in train_params]
         c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS+1):
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
-
             gs = [p.detach().clone() for p in train_params]
 
             new_params_all = []
             delta_c_all = []
 
             for cid in range(NUM_CLIENTS):
-                local_model = MiniResNetSVHN(10).to(device)
+                local_model = ResNet18SVHN(10).to(device)
 
                 with torch.no_grad():
                     j = 0
@@ -238,9 +221,7 @@ def federated_run():
 
             avg_params = []
             for i in range(len(train_params)):
-                avg_params.append(
-                    torch.stack([cp[i] for cp in new_params_all]).mean(0)
-                )
+                avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
 
             with torch.no_grad():
                 j = 0
