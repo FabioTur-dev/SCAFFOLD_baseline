@@ -12,26 +12,26 @@ from torchvision import models
 
 
 # ======================================================
-# CONFIG – tuned for 80%+ stability on SVHN α = 0.5
+# CONFIG
 # ======================================================
 
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5]
 NUM_ROUNDS = 30
-LOCAL_EPOCHS = 2
+LOCAL_EPOCHS = 1
 BATCH = 128
 
+# iperparametri che avevano funzionato
 LR_INIT = 0.01
-LR_DECAY_ROUND = 15
-LR_DECAY = 0.0015
+LR_DECAY_ROUND = 8      # decadi un po’ prima rispetto a 15
+LR_DECAY = 0.001
 
 BETA = 0.01
-DAMPING = 0.05     # meno aggressivo → più stabile in fine training
+DAMPING = 0.1
 GRAD_CLIP = 5.0
 SEED = 42
 
-IMG_SIZE = 160     # best resolution
-EMA_DECAY = 0.995  # GLOBAL EMA (stabilizza tutto)
+IMG_SIZE = 160   # risoluzione “magica” che ti dava ~80%
 
 
 def set_seed(s):
@@ -56,18 +56,18 @@ def gpu_augment(x):
 
 
 # ======================================================
-# LOAD SVHN RAW
+# LOAD SVHN RAW (NO CV2, NO PIL)
 # ======================================================
 
 def load_svhn_raw(path):
     mat = sio.loadmat(path)
-    X = mat["X"]           # (32, 32, 3, N)
+    X = mat["X"]           # (32,32,3,N)
     y = mat["y"].squeeze()
 
     y[y == 10] = 0
     y = y.astype(np.int64)
 
-    X = np.transpose(X, (3, 2, 0, 1))   # -> (N,3,32,32)
+    X = np.transpose(X, (3, 2, 0, 1))   # (N,3,32,32)
 
     X_t = torch.from_numpy(X).to(torch.uint8)
     y_t = torch.from_numpy(y).long()
@@ -101,7 +101,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ======================================================
-# RESNET18 – unlock ALL feature blocks (layer1-4)
+# RESNET18 – solo layer3, layer4, fc allenabili
 # ======================================================
 
 class ResNet18Pre(nn.Module):
@@ -119,16 +119,21 @@ class ResNet18Pre(nn.Module):
         in_f = self.m.fc.in_features
         self.m.fc = nn.Linear(in_f, nc)
 
-        # Free all layers (SVHN needs full adaptation)
+        # freeze tutto
+        for p in self.m.parameters():
+            p.requires_grad = False
+
+        # sblocca solo layer3, layer4, fc (come nella versione che andava bene)
         for name, p in self.m.named_parameters():
-            p.requires_grad = True
+            if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
+                p.requires_grad = True
 
     def forward(self, x):
         return self.m(x)
 
 
 # ======================================================
-# LOCAL CLIENT TRAINING (WITH SCAFFOLD)
+# LOCAL TRAINING (SCAFFOLD + resize per batch)
 # ======================================================
 
 def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
@@ -153,6 +158,7 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
             xb = xb_u8.to(device, dtype=torch.float32) / 255.0
             xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
             xb = (xb - mean) / std
+
             xb = gpu_augment(xb)
 
             opt.zero_grad()
@@ -160,14 +166,12 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
             loss = loss_fn(out, yb)
             loss.backward()
 
-            # SCAFFOLD correction
             for i, p in enumerate(train_params):
                 p.grad += DAMPING * (c_global[i] - c_local[i])
 
             torch.nn.utils.clip_grad_norm_(train_params, GRAD_CLIP)
             opt.step()
 
-    # compute deltas
     new_params = [p.detach().clone() for p in train_params]
     delta_c = []
 
@@ -182,17 +186,7 @@ def run_client(model, idxs, X_cpu_u8, y_cpu, c_global, c_local, lr, device):
 
 
 # ======================================================
-# GLOBAL EMA
-# ======================================================
-
-def ema_update(model, ema_model, decay=EMA_DECAY):
-    with torch.no_grad():
-        for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-            p_ema.mul_(decay).add_(p, alpha=(1 - decay))
-
-
-# ======================================================
-# EVAL (always on EMA model)
+# EVAL
 # ======================================================
 
 def evaluate(model, X_cpu_u8, y_cpu, device):
@@ -237,26 +231,27 @@ def federated_run():
         splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
 
         global_model = ResNet18Pre(10).to(device)
-
-        # EMA MODEL
-        ema_model = ResNet18Pre(10).to(device)
-        ema_model.load_state_dict(global_model.state_dict())
-
         train_params = [p for p in global_model.parameters() if p.requires_grad]
 
         c_global = [torch.zeros_like(p) for p in train_params]
-        c_locals = [[torch.zeros_like(p) for p in train_params]
-                    for _ in range(NUM_CLIENTS)]
+        c_locals = [[torch.zeros_like(p) for p in train_params] for _ in range(NUM_CLIENTS)]
 
         for rnd in range(1, NUM_ROUNDS+1):
 
+            # LR schedule semplice
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
+
+            # “foto” globale di partenza
             gs = [p.detach().clone() for p in train_params]
 
             new_params_all = []
             delta_c_all = []
 
-            for cid in range(NUM_CLIENTS):
+            # randomizza l’ordine dei client ogni round (stabilizza molto)
+            client_order = list(range(NUM_CLIENTS))
+            random.shuffle(client_order)
+
+            for cid in client_order:
 
                 local_model = ResNet18Pre(10).to(device)
 
@@ -281,7 +276,7 @@ def federated_run():
                 new_params_all.append(new_params)
                 delta_c_all.append(dc)
 
-            # PARAM AVG
+            # agregga parametri
             avg_params = []
             for i in range(len(train_params)):
                 avg_params.append(torch.stack([cp[i] for cp in new_params_all]).mean(0))
@@ -292,15 +287,11 @@ def federated_run():
                     if p.requires_grad:
                         p.copy_(avg_params[j]); j += 1
 
-            # C_GLOBAL
+            # aggiorna c_global
             for i in range(len(train_params)):
                 c_global[i] = torch.stack([dc[i] for dc in delta_c_all]).mean(0)
 
-            # EMA UPDATE
-            ema_update(global_model, ema_model)
-
-            # EVAL ALWAYS ON EMA
-            acc = evaluate(ema_model, X_test, y_test, device)
+            acc = evaluate(global_model, X_test, y_test, device)
             log(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
 
 
