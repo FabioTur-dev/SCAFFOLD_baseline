@@ -17,13 +17,13 @@ from torchvision.transforms.functional import to_pil_image
 
 
 # ==============================================================
-# CONFIG – Sequential SCAFFOLD (REAL & STABLE)
+# CONFIG – Sequential SCAFFOLD
 # ==============================================================
 
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.05]
+DIR_ALPHAS = [0.05, 0.5]   # <<< AGGIORNATO
 NUM_ROUNDS = 50
-LOCAL_EPOCHS = 2
+LOCAL_EPOCHS = 1
 BATCH = 128
 
 LR_INIT = 0.004
@@ -51,7 +51,7 @@ def log(msg):
 
 
 # ==============================================================
-# DATASET WRAPPER
+# DATASET WRAPPER – Resize 160×160
 # ==============================================================
 
 class RawDataset(Dataset):
@@ -64,7 +64,7 @@ class RawDataset(Dataset):
             self.T = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
-                transforms.Resize(224),
+                transforms.Resize(160),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -72,7 +72,7 @@ class RawDataset(Dataset):
             ])
         else:
             self.T = transforms.Compose([
-                transforms.Resize(224),
+                transforms.Resize(160),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
                                      (0.229,0.224,0.225)),
@@ -112,7 +112,7 @@ def dirichlet_split(labels, n_clients, alpha):
 
 
 # ==============================================================
-# MODEL – RESNET18 (layer3 + layer4 + fc sbloccati)
+# MODEL – RESNET18
 # ==============================================================
 
 class ResNet18Pre(nn.Module):
@@ -168,7 +168,6 @@ def run_client(model, train_idx, data, labels, c_global, c_local, lr, device):
             torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
             opt.step()
 
-    # Compute scaffold deltas
     new_params = [p.detach().clone().cpu() for p in trainable]
     delta_c = []
 
@@ -206,23 +205,23 @@ def federated_run(ds_name):
 
     device = "cuda:0"
 
-    # Load raw data once
-    if ds_name == "CIFAR10":
-        tr = datasets.CIFAR10("./data", train=True, download=True)
-        data = torch.tensor(tr.data).permute(0, 3, 1, 2)
-        labels = torch.tensor(tr.targets)
+    # Load SVHN
+    if ds_name == "SVHN":
+        tr = datasets.SVHN("./data", split="train", download=True)
+        data = torch.tensor(tr.data).permute(0, 2, 3, 1)   # [N,H,W,C] → same shape
+        labels = torch.tensor(tr.labels)
         nc = 10
     else:
-        raise ValueError("Only CIFAR10 implemented in version A")
+        raise ValueError("Only SVHN supported now")
 
-    # Test loader
+    # Test loader (Resize 160)
     transform_test = transforms.Compose([
-        transforms.Resize(224),
+        transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),
                              (0.229,0.224,0.225))
     ])
-    te = datasets.CIFAR10("./data", train=False, download=True, transform=transform_test)
+    te = datasets.SVHN("./data", split="test", download=True, transform=transform_test)
     testloader = DataLoader(te, batch_size=256, shuffle=False)
 
     labels_np = labels.numpy()
@@ -233,23 +232,19 @@ def federated_run(ds_name):
 
         splits = dirichlet_split(labels_np, NUM_CLIENTS, alpha)
 
-        # Global model
         global_model = ResNet18Pre(nc).to(device)
         trainable = [p for p in global_model.parameters() if p.requires_grad]
 
-        # SCAFFOLD control variates
         c_global = [torch.zeros_like(p).cpu() for p in trainable]
         c_locals = [
             [torch.zeros_like(p).cpu() for p in trainable]
             for _ in range(NUM_CLIENTS)
         ]
 
-        # Sequential rounds
         for rnd in range(1, NUM_ROUNDS + 1):
 
             lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
 
-            # Freeze the starting global weights for all clients this round
             global_start = [p.detach().clone().cpu() for p in trainable]
 
             new_params_all = []
@@ -257,10 +252,8 @@ def federated_run(ds_name):
 
             for cid in range(NUM_CLIENTS):
 
-                # Local model from SAME global start
                 local_model = ResNet18Pre(nc).to(device)
 
-                # load global start weights
                 with torch.no_grad():
                     idx = 0
                     for p in local_model.parameters():
@@ -268,7 +261,6 @@ def federated_run(ds_name):
                             p.copy_(global_start[idx].to(device))
                             idx += 1
 
-                # Train client
                 new_params, delta_c, new_c_local = run_client(
                     local_model,
                     splits[cid],
@@ -282,13 +274,11 @@ def federated_run(ds_name):
                 new_params_all.append(new_params)
                 delta_c_all.append(delta_c)
 
-            # Aggregate params
             avg_params = []
             for i in range(len(trainable)):
                 stacked = torch.stack([client_params[i] for client_params in new_params_all], dim=0)
                 avg_params.append(stacked.mean(0))
 
-            # Update global model
             with torch.no_grad():
                 idx = 0
                 for p in global_model.parameters():
@@ -296,12 +286,10 @@ def federated_run(ds_name):
                         p.copy_(avg_params[idx].to(device))
                         idx += 1
 
-            # Update c_global
             for i in range(len(c_global)):
                 stacked = torch.stack([dc[i] for dc in delta_c_all], dim=0)
                 c_global[i] = stacked.mean(0)
 
-            # Eval
             acc = evaluate(global_model, testloader, device)
             log(f"[ROUND {rnd}] ACC={acc*100:.2f}%")
 
@@ -312,11 +300,12 @@ def federated_run(ds_name):
 
 def main():
     set_seed(SEED)
-    federated_run("CIFAR10")
+    federated_run("SVHN")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
