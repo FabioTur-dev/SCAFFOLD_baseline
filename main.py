@@ -56,12 +56,13 @@ def log(msg):
 
 class RawDataset(Dataset):
     def __init__(self, data, labels, indices, augment=False):
-        self.data = data
+        self.data = data          # numpy array [N, 32, 32, 3]
         self.labels = labels
         self.indices = indices
 
         if augment:
             self.T = transforms.Compose([
+                transforms.ToPILImage(),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomCrop(32, padding=4),
                 transforms.Resize(160),
@@ -72,6 +73,7 @@ class RawDataset(Dataset):
             ])
         else:
             self.T = transforms.Compose([
+                transforms.ToPILImage(),
                 transforms.Resize(160),
                 transforms.ToTensor(),
                 transforms.Normalize((0.485,0.456,0.406),
@@ -80,9 +82,11 @@ class RawDataset(Dataset):
 
     def __getitem__(self, i):
         idx = self.indices[i]
-        img = to_pil_image(self.data[idx])
-        img = self.T(img)
-        return img, self.labels[idx]
+        img_np = self.data[idx]   # shape [32,32,3], valid
+        label = self.labels[idx]
+
+        img = self.T(img_np)
+        return img, label
 
     def __len__(self):
         return len(self.indices)
