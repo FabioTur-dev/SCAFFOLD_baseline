@@ -18,7 +18,7 @@ from torchvision import models
 NUM_CLIENTS = 10
 DIR_ALPHAS = [0.5]
 NUM_ROUNDS = 30
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = 2
 BATCH = 128
 
 # iperparametri che avevano funzionato meglio
