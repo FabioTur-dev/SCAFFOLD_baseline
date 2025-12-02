@@ -22,7 +22,6 @@ SEED = 42
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 # ======================================================
 # UTILITIES
 # ======================================================
@@ -33,203 +32,157 @@ def seed_everything(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+# ======================================================
+# MODEL 32×32 FRIENDLY RESNET-18
+# ======================================================
+class ResNet18_SVHN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = models.resnet18(weights=None)   # niente pretrained su 224px
+        # Modifica il primo conv per 32×32 (padding ridotto)
+        self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.model.maxpool = nn.Identity()  # SVHN è 32px, no maxpool iniziale
+        self.model.fc = nn.Linear(512, 10)
+
+    def forward(self, x):
+        return self.model(x)
 
 # ======================================================
-# FAST SVHN PREPROCESS (GPU)
+# LOCAL TRAIN
 # ======================================================
-def preprocess_svhn_to_ram(raw_dataset):
-    print(f"Preprocessing SVHN split '{raw_dataset.split}' into RAM (GPU accelerated)...")
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    # raw_dataset.data is ndarray (N, H, W, C)
-    X = torch.from_numpy(raw_dataset.data)          # uint8 HWC
-    X = X.permute(0, 3, 1, 2).float() / 255.0       # -> NCHW float32
-    Y = torch.tensor(raw_dataset.labels, dtype=torch.long)
+def local_train(local_model, loader):
+    local_model.train()
+    opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
+    loss_fn = nn.CrossEntropyLoss()
 
-    # Move to GPU
-    X = X.to("cuda", non_blocking=True)
+    for _ in range(LOCAL_EPOCHS):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
 
-    # Resize to 160x160 using GPU
-    X = torch.nn.functional.interpolate(
-        X, size=(160, 160), mode="bilinear", align_corners=False
-    )
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                loss = loss_fn(local_model(x), y)
 
-    # Normalize (vectorized)
-    mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
-    X = (X - mean) / std
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
 
-    # Return to CPU for client slicing
-    X = X.cpu()
-
-    print(f"Done preprocessing {len(X)} images.")
-    return X, Y
-
+    return local_model.state_dict()
 
 # ======================================================
-# SIMPLE DATASET FROM RAM
+# FEDAVG
 # ======================================================
-class SVHNRAM(torch.utils.data.Dataset):
-    def __init__(self, X, Y):
-        self.X = X
-        self.Y = Y
+def fedavg(states):
+    avg = {}
+    with torch.no_grad():
+        for k in states[0]:
+            stacked = torch.stack([s[k].to(DEVICE) for s in states], dim=0)
+            avg[k] = stacked.mean(0)
+    return avg
 
-    def __len__(self):
-        return len(self.X)
+# ======================================================
+# EVALUATION
+# ======================================================
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return 100 * correct / total
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
+# ======================================================
+# DIRICHLET SPLIT
+# ======================================================
+def dirichlet_split(labels, num_clients, alpha):
+    labels = np.array(labels)
+    num_classes = len(np.unique(labels))
+    client_indices = [[] for _ in range(num_clients)]
 
+    for c in range(num_classes):
+        idx = np.where(labels == c)[0]
+        np.random.shuffle(idx)
+
+        props = np.random.dirichlet([alpha] * num_clients)
+        props = (props * len(idx)).astype(int)
+
+        # fix rounding
+        while props.sum() < len(idx):
+            props[np.argmax(props)] += 1
+
+        start = 0
+        for i in range(num_clients):
+            end = start + props[i]
+            client_indices[i].extend(idx[start:end])
+            start = end
+
+    return client_indices
 
 # ======================================================
 # MAIN
 # ======================================================
 def main():
-
     seed_everything(SEED)
 
-    # -------------------------
-    # LOAD SVHN RAW
-    # -------------------------
-    raw_train = datasets.SVHN("./data", split="train", download=True, transform=None)
-    raw_test  = datasets.SVHN("./data", split="test", download=True, transform=None)
+    # ==================================================
+    # LOADER ON-THE-FLY (zero OOM, super leggero)
+    # ==================================================
+    transform = transforms.Compose([
+        transforms.ToTensor(),   # mantiene 32×32 originale
+        transforms.Normalize(    # SVHN normalization
+            (0.4377, 0.4438, 0.4728),
+            (0.1980, 0.2010, 0.1970)
+        )
+    ])
 
-    # -------------------------
-    # FAST GPU PREPROCESS
-    # -------------------------
-    X_train, Y_train = preprocess_svhn_to_ram(raw_train)
-    X_test,  Y_test  = preprocess_svhn_to_ram(raw_test)
+    train_raw = datasets.SVHN("./data", split="train", download=True, transform=transform)
+    test_raw  = datasets.SVHN("./data", split="test", download=True, transform=transform)
 
-    trainset = SVHNRAM(X_train, Y_train)
-    testset  = SVHNRAM(X_test,  Y_test)
+    testloader = DataLoader(test_raw, batch_size=BATCH, shuffle=False, num_workers=2, pin_memory=True)
 
-    testloader = DataLoader(
-        testset, batch_size=BATCH, shuffle=False, num_workers=0, pin_memory=True
-    )
+    labels_train = train_raw.labels  # numpy array of labels
 
-    # ======================================================
-    # DIRICHLET SPLIT
-    # ======================================================
-    def dirichlet_split(labels, num_clients, alpha):
-        num_classes = 10
-        labels = np.array(labels)
-        client_indices = [[] for _ in range(num_clients)]
-
-        for c in range(num_classes):
-            idx = np.where(labels == c)[0]
-            np.random.shuffle(idx)
-
-            props = np.random.dirichlet([alpha] * num_clients)
-            props = (props * len(idx)).astype(int)
-
-            while props.sum() < len(idx):
-                props[np.argmax(props)] += 1
-
-            start = 0
-            for i in range(num_clients):
-                end = start + props[i]
-                client_indices[i].extend(idx[start:end])
-                start = end
-
-        return client_indices
-
-    # ======================================================
-    # MODEL FACTORY
-    # ======================================================
-    def build_resnet18():
-        model = models.resnet18(pretrained=True)
-        model.fc = nn.Linear(512, 10)
-        return model
-
-    # ======================================================
-    # LOCAL TRAIN
-    # ======================================================
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
-    def local_train(local_model, loader):
-        local_model.train()
-        opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
-        loss_fn = nn.CrossEntropyLoss()
-
-        for _ in range(LOCAL_EPOCHS):
-            for x, y in loader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-
-                opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    loss = loss_fn(local_model(x), y)
-
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-
-        return local_model.state_dict()
-
-    # ======================================================
-    # FEDAVG
-    # ======================================================
-    def fedavg(states):
-        states_float = [
-            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
-             for k, v in st.items()}
-            for st in states
-        ]
-        avg = {}
-        with torch.no_grad():
-            for k in states_float[0]:
-                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
-                avg[k] = stacked.mean(dim=0)
-        return avg
-
-    # ======================================================
-    # EVALUATION
-    # ======================================================
-    def evaluate(model):
-        model.eval()
-        correct, total = 0, 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            for x, y in testloader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-                pred = model(x).argmax(1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-        return 100 * correct / total
-
-    # ======================================================
-    # LOOP SU ALPHA
-    # ======================================================
+    # ==================================================
+    # LOOP OVER Dirichlet ALPHAS
+    # ==================================================
     for ALPHA in ALPHAS:
-
         print("\n============================")
         print(f"=== Dirichlet alpha = {ALPHA} ===")
-        print("============================\n")
+        print("============================")
 
-        client_indices = dirichlet_split(Y_train, NUM_CLIENTS, ALPHA)
-        global_model = build_resnet18().to(DEVICE)
+        # Build global model
+        global_model = ResNet18_SVHN().to(DEVICE)
+
+        # Client splits
+        client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
 
         for rnd in range(1, ROUNDS + 1):
             local_states = []
 
             for cid in range(NUM_CLIENTS):
-                subset = Subset(trainset, client_indices[cid])
-                loader = DataLoader(
-                    subset, batch_size=BATCH, shuffle=True,
-                    num_workers=0, pin_memory=True
-                )
+                subset = Subset(train_raw, client_indices[cid])
+                loader = DataLoader(subset, batch_size=BATCH, shuffle=True,
+                                    num_workers=2, pin_memory=True)
 
-                local_model = build_resnet18().to(DEVICE)
+                local_model = ResNet18_SVHN().to(DEVICE)
                 local_model.load_state_dict(global_model.state_dict(), strict=True)
 
-                st = local_train(local_model, loader)
-                local_states.append(st)
+                state = local_train(local_model, loader)
+                local_states.append(state)
 
             new_state = fedavg(local_states)
             global_model.load_state_dict(new_state)
 
-            acc = evaluate(global_model)
+            acc = evaluate(global_model, testloader)
             print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
-
 
 # ======================================================
 # ENTRYPOINT
