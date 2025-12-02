@@ -33,22 +33,15 @@ def seed_everything(s):
         torch.cuda.manual_seed_all(s)
 
 # ======================================================
-# MODEL 32×32 FRIENDLY RESNET-18 (per CIFAR-100)
+# MODEL — ResNet18 PRETRAINED (NO MODIFICHE)
 # ======================================================
-class ResNet18_C100(nn.Module):
+class ResNet18_C100_FULL(nn.Module):
     def __init__(self):
         super().__init__()
 
         self.model = models.resnet18(pretrained=True)
 
-        # conv1 adattata a 32×32
-        self.model.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
-        )
-        # niente maxpool
-        self.model.maxpool = nn.Identity()
-
-        # 100 classi CIFAR-100
+        # testina CIFAR-100
         self.model.fc = nn.Linear(512, 100)
 
     def forward(self, x):
@@ -144,8 +137,9 @@ def dirichlet_split(labels, num_clients, alpha):
 def main():
     seed_everything(SEED)
 
-    # CIFAR-100 normalization
+    # 🔥 TRASFORMAZIONI IDENTICHE AL CODICE VECCHIO → accuracy alta
     transform = transforms.Compose([
+        transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=(0.5071, 0.4867, 0.4408),
@@ -159,15 +153,17 @@ def main():
     testloader = DataLoader(test_raw, batch_size=BATCH, shuffle=False,
                             num_workers=2, pin_memory=True)
 
-    labels_train = train_raw.targets  # CIFAR-100 labels
+    labels_train = train_raw.targets
 
     for ALPHA in ALPHAS:
         print("\n============================")
         print(f"=== Dirichlet alpha = {ALPHA} ===")
         print("============================")
 
-        global_model = ResNet18_C100().to(DEVICE)
+        # modello globale (ResNet18 ImageNet 100 classi)
+        global_model = ResNet18_C100_FULL().to(DEVICE)
 
+        # split clienti
         client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
 
         for rnd in range(1, ROUNDS + 1):
@@ -178,7 +174,7 @@ def main():
                 loader = DataLoader(subset, batch_size=BATCH, shuffle=True,
                                     num_workers=2, pin_memory=True)
 
-                local_model = ResNet18_C100().to(DEVICE)
+                local_model = ResNet18_C100_FULL().to(DEVICE)
                 local_model.load_state_dict(global_model.state_dict(), strict=True)
 
                 state = local_train(local_model, loader)
@@ -195,3 +191,4 @@ def main():
 # ======================================================
 if __name__ == "__main__":
     main()
+
