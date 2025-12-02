@@ -13,7 +13,7 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.05, 0.1]   # <--- qui le due alpha
+ALPHAS = [0.5]   # <--- qui le due alpha
 LOCAL_EPOCHS = 1
 BATCH = 256
 ROUNDS = 25
