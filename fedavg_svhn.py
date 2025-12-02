@@ -89,9 +89,18 @@ def fedavg(states):
     avg = {}
     with torch.no_grad():
         for k in states[0]:
-            stacked = torch.stack([s[k].to(DEVICE) for s in states], dim=0)
-            avg[k] = stacked.mean(0)
+            tensors = [s[k] for s in states]
+
+            if tensors[0].dtype in [torch.float16, torch.float32, torch.float64]:
+                # media sui tensori float
+                stacked = torch.stack(tensors, dim=0).to(DEVICE)
+                avg[k] = stacked.mean(dim=0)
+            else:
+                # tensori long/int → copia del primo (identici)
+                avg[k] = tensors[0].clone().to(DEVICE)
+
     return avg
+
 
 # ======================================================
 # EVALUATION
