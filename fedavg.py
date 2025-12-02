@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+import random
+
+# ======================================================
+# CONFIG
+# ======================================================
+NUM_CLIENTS = 10
+ALPHA = 0.5
+LOCAL_EPOCHS = 1
+BATCH = 128
+ROUNDS = 10
+LR = 0.001
+SEED = 42
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def seed_everything(s):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+
+# ======================================================
+def main():
+
+    seed_everything(SEED)
+
+    # ======================================================
+    # VERY FAST TRANSFORMS (no Resize 224!)
+    # ======================================================
+    transform = transforms.Compose([
+        transforms.Resize(160),    # <--- molto più veloce e basta per pretrained
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
+    # ======================================================
+    # LOAD CIFAR-10
+    # ======================================================
+    trainset = datasets.CIFAR10("./data", train=True, download=True, transform=transform)
+    testset  = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
+
+    testloader = DataLoader(
+        testset, batch_size=256, shuffle=False,
+        num_workers=0, pin_memory=True
+    )
+
+    # ======================================================
+    # DIRICHLET SPLIT
+    # ======================================================
+    def dirichlet_split(dataset, num_clients, alpha):
+        labels = np.array(dataset.targets)
+        num_classes = 10
+        client_indices = [[] for _ in range(num_clients)]
+
+        for c in range(num_classes):
+            idx = np.where(labels == c)[0]
+            np.random.shuffle(idx)
+
+            props = np.random.dirichlet([alpha] * num_clients)
+            props = (props * len(idx)).astype(int)
+
+            while props.sum() < len(idx):
+                props[np.argmax(props)] += 1
+
+            start = 0
+            for i in range(num_clients):
+                end = start + props[i]
+                client_indices[i].extend(idx[start:end])
+                start = end
+
+        return client_indices
+
+    client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
+
+    # ======================================================
+    # MODEL FACTORY (create once)
+    # ======================================================
+    def build_resnet18():
+        model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        model.fc = nn.Linear(512, 10)
+        return model
+
+    # global model (single GPU upload)
+    global_model = build_resnet18().to(DEVICE)
+
+    # ======================================================
+    # LOCAL TRAIN (AMP + NO MODEL RECREATION)
+    # ======================================================
+    scaler = torch.cuda.amp.GradScaler()
+
+    def local_train(local_model, loader):
+        local_model.train()
+        opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
+        loss_fn = nn.CrossEntropyLoss()
+
+        for _ in range(LOCAL_EPOCHS):
+            for x, y in loader:
+                x = x.to(DEVICE, non_blocking=True)
+                y = y.to(DEVICE, non_blocking=True)
+
+                opt.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast():
+                    loss = loss_fn(local_model(x), y)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+
+        return local_model.state_dict()
+
+    # ======================================================
+    # FEDAVG GPU-accelerated
+    # ======================================================
+    def fedavg(states):
+        avg = {}
+        with torch.no_grad():
+            for k in states[0].keys():
+                stacked = torch.stack([s[k] for s in states], dim=0).to(DEVICE)
+                avg[k] = stacked.mean(dim=0)
+        return avg
+
+    # ======================================================
+    # EVALUATION
+    # ======================================================
+    def evaluate(model):
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            for x, y in testloader:
+                x = x.to(DEVICE, non_blocking=True)
+                y = y.to(DEVICE, non_blocking=True)
+                pred = model(x).argmax(1)
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+        return 100 * correct / total
+
+    # ======================================================
+    # FEDAVG MAIN LOOP
+    # ======================================================
+    for rnd in range(1, ROUNDS+1):
+
+        local_states = []
+
+        for cid in range(NUM_CLIENTS):
+
+            subset = Subset(trainset, client_indices[cid])
+            loader = DataLoader(
+                subset,
+                batch_size=BATCH,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True
+            )
+
+            # instead of recreating model → fast clone
+            local_model = build_resnet18().to(DEVICE)
+            local_model.load_state_dict(global_model.state_dict(), strict=True)
+
+            st = local_train(local_model, loader)
+            local_states.append(st)
+
+        new_state = fedavg(local_states)
+        global_model.load_state_dict(new_state)
+
+        acc = evaluate(global_model)
+        print(f"[ROUND {rnd}] ACC = {acc:.2f}%")
+
+
+
+# ======================================================
+# WINDOWS GUARD
+# ======================================================
+if __name__ == "__main__":
+    main()
