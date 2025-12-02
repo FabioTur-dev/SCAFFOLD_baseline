@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader, Subset
 import numpy as np
 import random
 
@@ -13,16 +13,19 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.5, 0.1, 0.05]      # più alpha
+ALPHAS = [0.5, 0.1, 0.05]
 LOCAL_EPOCHS = 1
 BATCH = 256
 ROUNDS = 25
 LR = 0.001
 SEED = 42
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# ======================================================
+# UTILITIES
+# ======================================================
 def seed_everything(s):
     random.seed(s)
     np.random.seed(s)
@@ -32,84 +35,83 @@ def seed_everything(s):
 
 
 # ======================================================
-# FAST RAM DATASET
+# FAST SVHN PREPROCESS (GPU)
 # ======================================================
-class RAMDataset(Dataset):
+def preprocess_svhn_to_ram(raw_dataset):
+    print(f"Preprocessing SVHN split '{raw_dataset.split}' into RAM (GPU accelerated)...")
+
+    # raw_dataset.data is ndarray (N, H, W, C)
+    X = torch.from_numpy(raw_dataset.data)          # uint8 HWC
+    X = X.permute(0, 3, 1, 2).float() / 255.0       # -> NCHW float32
+    Y = torch.tensor(raw_dataset.labels, dtype=torch.long)
+
+    # Move to GPU
+    X = X.to("cuda", non_blocking=True)
+
+    # Resize to 160x160 using GPU
+    X = torch.nn.functional.interpolate(
+        X, size=(160, 160), mode="bilinear", align_corners=False
+    )
+
+    # Normalize (vectorized)
+    mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+    X = (X - mean) / std
+
+    # Return to CPU for client slicing
+    X = X.cpu()
+
+    print(f"Done preprocessing {len(X)} images.")
+    return X, Y
+
+
+# ======================================================
+# SIMPLE DATASET FROM RAM
+# ======================================================
+class SVHNRAM(torch.utils.data.Dataset):
     def __init__(self, X, Y):
         self.X = X
         self.Y = Y
 
     def __len__(self):
-        return len(self.Y)
+        return len(self.X)
 
     def __getitem__(self, idx):
         return self.X[idx], self.Y[idx]
 
 
+# ======================================================
+# MAIN
+# ======================================================
 def main():
 
     seed_everything(SEED)
 
-    # ======================================================
-    # TRANSFORMS (applied ONCE only)
-    # ======================================================
-    preprocess = transforms.Compose([
-        transforms.Resize(160),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    # -------------------------
+    # LOAD SVHN RAW
+    # -------------------------
+    raw_train = datasets.SVHN("./data", split="train", download=True, transform=None)
+    raw_test  = datasets.SVHN("./data", split="test", download=True, transform=None)
 
-    # ======================================================
-    # LOAD RAW SVHN
-    # ======================================================
-    raw_train = datasets.SVHN(root="./data", split='train',
-                              download=True, transform=None)
-    raw_test  = datasets.SVHN(root="./data", split='test',
-                              download=True, transform=None)
+    # -------------------------
+    # FAST GPU PREPROCESS
+    # -------------------------
+    X_train, Y_train = preprocess_svhn_to_ram(raw_train)
+    X_test,  Y_test  = preprocess_svhn_to_ram(raw_test)
 
-    # ======================================================
-    # PREPROCESS SVHN INTO RAM  (🔥 key difference)
-    # ======================================================
-    print("\n=== Preprocessing SVHN into RAM (train) ===")
-    X_train, Y_train = [], []
-    for img, label in raw_train:
-        X_train.append(preprocess(img))
-        Y_train.append(label)
-
-    X_train = torch.stack(X_train, dim=0)
-    Y_train = torch.tensor(Y_train, dtype=torch.long)
-
-    print("Train RAM ready:", X_train.shape)
-
-    print("\n=== Preprocessing SVHN into RAM (test) ===")
-    X_test, Y_test = [], []
-    for img, label in raw_test:
-        X_test.append(preprocess(img))
-        Y_test.append(label)
-
-    X_test = torch.stack(X_test, dim=0)
-    Y_test = torch.tensor(Y_test, dtype=torch.long)
-
-    print("Test RAM ready:", X_test.shape)
-
-    # RAM datasets
-    trainRAM = RAMDataset(X_train, Y_train)
-    testRAM  = RAMDataset(X_test,  Y_test)
+    trainset = SVHNRAM(X_train, Y_train)
+    testset  = SVHNRAM(X_test,  Y_test)
 
     testloader = DataLoader(
-        testRAM, batch_size=256, shuffle=False,
-        num_workers=0, pin_memory=True
+        testset, batch_size=BATCH, shuffle=False, num_workers=0, pin_memory=True
     )
 
     # ======================================================
     # DIRICHLET SPLIT
     # ======================================================
-    def dirichlet_split(Y, num_clients, alpha):
-        labels = np.array(Y)
+    def dirichlet_split(labels, num_clients, alpha):
         num_classes = 10
+        labels = np.array(labels)
         client_indices = [[] for _ in range(num_clients)]
 
         for c in range(num_classes):
@@ -167,10 +169,15 @@ def main():
     # FEDAVG
     # ======================================================
     def fedavg(states):
+        states_float = [
+            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
+             for k, v in st.items()}
+            for st in states
+        ]
         avg = {}
         with torch.no_grad():
-            for k in states[0].keys():
-                stacked = torch.stack([s[k].float() for s in states], dim=0).to(DEVICE)
+            for k in states_float[0]:
+                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
                 avg[k] = stacked.mean(dim=0)
         return avg
 
@@ -180,42 +187,39 @@ def main():
     def evaluate(model):
         model.eval()
         correct, total = 0, 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
             for x, y in testloader:
-                x = x.to(DEVICE)
-                y = y.to(DEVICE)
+                x = x.to(DEVICE, non_blocking=True)
+                y = y.to(DEVICE, non_blocking=True)
                 pred = model(x).argmax(1)
                 correct += (pred == y).sum().item()
                 total += y.size(0)
         return 100 * correct / total
 
     # ======================================================
-    # MAIN FEDAVG LOOP
+    # LOOP SU ALPHA
     # ======================================================
     for ALPHA in ALPHAS:
-        print(f"\n============================")
-        print(f"=== Dirichlet alpha = {ALPHA} ===")
-        print(f"============================\n")
 
-        client_splits = dirichlet_split(Y_train, NUM_CLIENTS, ALPHA)
+        print("\n============================")
+        print(f"=== Dirichlet alpha = {ALPHA} ===")
+        print("============================\n")
+
+        client_indices = dirichlet_split(Y_train, NUM_CLIENTS, ALPHA)
         global_model = build_resnet18().to(DEVICE)
 
         for rnd in range(1, ROUNDS + 1):
             local_states = []
 
             for cid in range(NUM_CLIENTS):
-
-                subset = Subset(trainRAM, client_splits[cid])
+                subset = Subset(trainset, client_indices[cid])
                 loader = DataLoader(
-                    subset,
-                    batch_size=BATCH,
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=True
+                    subset, batch_size=BATCH, shuffle=True,
+                    num_workers=0, pin_memory=True
                 )
 
                 local_model = build_resnet18().to(DEVICE)
-                local_model.load_state_dict(global_model.state_dict())
+                local_model.load_state_dict(global_model.state_dict(), strict=True)
 
                 st = local_train(local_model, loader)
                 local_states.append(st)
@@ -227,6 +231,8 @@ def main():
             print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
 
-
+# ======================================================
+# ENTRYPOINT
+# ======================================================
 if __name__ == "__main__":
     main()

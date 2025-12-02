@@ -34,7 +34,7 @@ mpl.rcParams["savefig.dpi"] = 220
 mpl.rcParams["font.family"] = "DejaVu Sans"
 mpl.rcParams["font.size"] = 10
 
-fig, ax = plt.subplots(figsize=(6.6, 3.6))
+fig, ax = plt.subplots(figsize=(6.8, 3.6))
 ax.set_facecolor("#F7F8FB")
 
 # ==========================================
@@ -66,7 +66,6 @@ ax.set_axisbelow(True)
 color_005 = "#2C587A"   # blu petrolio
 color_01  = "#C45A32"   # arancione “paper”
 
-# α = 0.05
 ax.plot(rounds, acc_a005, lw=1.3, color=color_005, zorder=3)
 ax.scatter(
     rounds, acc_a005,
@@ -75,7 +74,6 @@ ax.scatter(
     label=r"$\alpha{=}0.05$"
 )
 
-# α = 0.1
 ax.plot(rounds, acc_a01, lw=1.3, color=color_01, zorder=3)
 ax.scatter(
     rounds, acc_a01,
@@ -102,7 +100,7 @@ for x, y in zip(rounds[::5], acc_a01[::5]):
     )
 
 # ==========================================
-#  MINI-CHART (INSET) PIÙ PICCOLO (20–25)
+#  MINI-CHART (INSET) (20–25)
 # ==========================================
 axins = inset_axes(
     ax,
@@ -145,15 +143,15 @@ for spine in ["top", "right"]:
     ax.spines[spine].set_visible(False)
 
 # ==========================================
-#  LEGENDA: SOLO α=..., VERTICALE
-#  accanto al mini-chart (zona basso-destra)
+#  LEGENDA A SINISTRA DEL MINI-CHART
+#  (dentro l'asse principale)
 # ==========================================
 legend = ax.legend(
     frameon=True,
     fontsize=9,
-    loc="lower right",         # ancorata in basso a destra
-    bbox_to_anchor=(0.98, 0.35),  # spostata verso il mini chart
-    ncol=1,                    # elementi uno sopra l'altro
+    loc="center right",          # ancorata sul lato destro della legenda
+    bbox_to_anchor=(0.80, 0.27), # x<1 ⇒ dentro l'asse, poco a sinistra dell'inset
+    ncol=1,
     borderpad=0.5,
     handlelength=2.2,
     handletextpad=0.6
@@ -163,4 +161,4 @@ legend.get_frame().set_edgecolor("#D0D5E3")
 
 plt.tight_layout()
 plt.show()
-# plt.savefig("fedavg_dirichlet_legend_side_inset.png", bbox_inches="tight")
+# plt.savefig("fedavg_dirichlet_legend_left_of_inset.png", bbox_inches="tight")
