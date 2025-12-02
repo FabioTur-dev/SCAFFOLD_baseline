@@ -36,10 +36,10 @@ def main():
     seed_everything(SEED)
 
     # ======================================================
-    # VERY FAST TRANSFORMS (no Resize 224!)
+    # FAST TRANSFORMS (resize 160 instead of 224)
     # ======================================================
     transform = transforms.Compose([
-        transforms.Resize(160),    # <--- molto più veloce e basta per pretrained
+        transforms.Resize(160),   # Much faster and still works well for pretrained ResNet
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -54,8 +54,11 @@ def main():
     testset  = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
 
     testloader = DataLoader(
-        testset, batch_size=256, shuffle=False,
-        num_workers=0, pin_memory=True
+        testset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True
     )
 
     # ======================================================
@@ -73,6 +76,7 @@ def main():
             props = np.random.dirichlet([alpha] * num_clients)
             props = (props * len(idx)).astype(int)
 
+            # Ajust sum
             while props.sum() < len(idx):
                 props[np.argmax(props)] += 1
 
@@ -87,20 +91,22 @@ def main():
     client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
 
     # ======================================================
-    # MODEL FACTORY (create once)
+    # MODEL FACTORY (COMPATIBLE VERSION)
     # ======================================================
     def build_resnet18():
-        model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        model = models.resnet18(pretrained=True)   # <-- works with old torchvision!
         model.fc = nn.Linear(512, 10)
         return model
 
-    # global model (single GPU upload)
+    # ------------------------------------------------------
+    # global model on GPU
+    # ------------------------------------------------------
     global_model = build_resnet18().to(DEVICE)
 
     # ======================================================
-    # LOCAL TRAIN (AMP + NO MODEL RECREATION)
+    # LOCAL TRAIN (AMP + optimised)
     # ======================================================
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     def local_train(local_model, loader):
         local_model.train()
@@ -113,8 +119,9 @@ def main():
                 y = y.to(DEVICE, non_blocking=True)
 
                 opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     loss = loss_fn(local_model(x), y)
+
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
@@ -122,7 +129,7 @@ def main():
         return local_model.state_dict()
 
     # ======================================================
-    # FEDAVG GPU-accelerated
+    # FEDAVG (GPU)
     # ======================================================
     def fedavg(states):
         avg = {}
@@ -139,7 +146,7 @@ def main():
         model.eval()
         correct = 0
         total = 0
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
             for x, y in testloader:
                 x = x.to(DEVICE, non_blocking=True)
                 y = y.to(DEVICE, non_blocking=True)
@@ -151,13 +158,13 @@ def main():
     # ======================================================
     # FEDAVG MAIN LOOP
     # ======================================================
-    for rnd in range(1, ROUNDS+1):
-
+    for rnd in range(1, ROUNDS + 1):
         local_states = []
 
         for cid in range(NUM_CLIENTS):
 
             subset = Subset(trainset, client_indices[cid])
+
             loader = DataLoader(
                 subset,
                 batch_size=BATCH,
@@ -166,7 +173,7 @@ def main():
                 pin_memory=True
             )
 
-            # instead of recreating model → fast clone
+            # clone model
             local_model = build_resnet18().to(DEVICE)
             local_model.load_state_dict(global_model.state_dict(), strict=True)
 
