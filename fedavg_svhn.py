@@ -35,17 +35,27 @@ def seed_everything(s):
 # ======================================================
 # MODEL 32×32 FRIENDLY RESNET-18
 # ======================================================
+# ======================================================
+# MODEL 32×32 FRIENDLY RESNET-18 (torchvision vecchio)
+# ======================================================
 class ResNet18_SVHN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = models.resnet18(weights=None)   # niente pretrained su 224px
-        # Modifica il primo conv per 32×32 (padding ridotto)
-        self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.model.maxpool = nn.Identity()  # SVHN è 32px, no maxpool iniziale
+        # usa pretrained=False invece di weights=None
+        self.model = models.resnet18(pretrained=True)
+
+        # conv1 + maxpool adattati a input 32×32
+        self.model.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.model.maxpool = nn.Identity()
+
+        # output 10 classi
         self.model.fc = nn.Linear(512, 10)
 
     def forward(self, x):
         return self.model(x)
+
 
 # ======================================================
 # LOCAL TRAIN
