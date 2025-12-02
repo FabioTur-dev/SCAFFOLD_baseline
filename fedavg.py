@@ -22,6 +22,7 @@ SEED = 42
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def seed_everything(s):
     random.seed(s)
     np.random.seed(s)
@@ -30,16 +31,15 @@ def seed_everything(s):
         torch.cuda.manual_seed_all(s)
 
 
-# ======================================================
 def main():
 
     seed_everything(SEED)
 
     # ======================================================
-    # FAST TRANSFORMS (resize 160 instead of 224)
+    # FAST TRANSFORMS
     # ======================================================
     transform = transforms.Compose([
-        transforms.Resize(160),   # Much faster and still works well for pretrained ResNet
+        transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -54,11 +54,8 @@ def main():
     testset  = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
 
     testloader = DataLoader(
-        testset,
-        batch_size=256,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
+        testset, batch_size=256, shuffle=False,
+        num_workers=0, pin_memory=True
     )
 
     # ======================================================
@@ -76,7 +73,6 @@ def main():
             props = np.random.dirichlet([alpha] * num_clients)
             props = (props * len(idx)).astype(int)
 
-            # Ajust sum
             while props.sum() < len(idx):
                 props[np.argmax(props)] += 1
 
@@ -91,20 +87,17 @@ def main():
     client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
 
     # ======================================================
-    # MODEL FACTORY (COMPATIBLE VERSION)
+    # MODEL FACTORY
     # ======================================================
     def build_resnet18():
-        model = models.resnet18(pretrained=True)   # <-- works with old torchvision!
+        model = models.resnet18(pretrained=True)
         model.fc = nn.Linear(512, 10)
         return model
 
-    # ------------------------------------------------------
-    # global model on GPU
-    # ------------------------------------------------------
     global_model = build_resnet18().to(DEVICE)
 
     # ======================================================
-    # LOCAL TRAIN (AMP + optimised)
+    # LOCAL TRAIN
     # ======================================================
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
@@ -129,14 +122,23 @@ def main():
         return local_model.state_dict()
 
     # ======================================================
-    # FEDAVG (GPU)
+    # FEDAVG FIXATO
     # ======================================================
     def fedavg(states):
+
+        # convert ALL states to float to avoid LongTensor mean error
+        states_float = [
+            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
+             for k, v in st.items()}
+            for st in states
+        ]
+
         avg = {}
         with torch.no_grad():
-            for k in states[0].keys():
-                stacked = torch.stack([s[k] for s in states], dim=0).to(DEVICE)
+            for k in states_float[0].keys():
+                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
                 avg[k] = stacked.mean(dim=0)
+
         return avg
 
     # ======================================================
@@ -162,9 +164,7 @@ def main():
         local_states = []
 
         for cid in range(NUM_CLIENTS):
-
             subset = Subset(trainset, client_indices[cid])
-
             loader = DataLoader(
                 subset,
                 batch_size=BATCH,
@@ -173,7 +173,6 @@ def main():
                 pin_memory=True
             )
 
-            # clone model
             local_model = build_resnet18().to(DEVICE)
             local_model.load_state_dict(global_model.state_dict(), strict=True)
 
@@ -185,7 +184,6 @@ def main():
 
         acc = evaluate(global_model)
         print(f"[ROUND {rnd}] ACC = {acc:.2f}%")
-
 
 
 # ======================================================
