@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset
 import numpy as np
 import random
 
@@ -13,7 +13,7 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.5, 0.1, 0.05]   # una o più alpha
+ALPHAS = [0.5, 0.1, 0.05]      # più alpha
 LOCAL_EPOCHS = 1
 BATCH = 256
 ROUNDS = 25
@@ -31,40 +31,84 @@ def seed_everything(s):
         torch.cuda.manual_seed_all(s)
 
 
+# ======================================================
+# FAST RAM DATASET
+# ======================================================
+class RAMDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = X
+        self.Y = Y
+
+    def __len__(self):
+        return len(self.Y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+
 def main():
 
     seed_everything(SEED)
 
     # ======================================================
-    # TRANSFORMS
+    # TRANSFORMS (applied ONCE only)
     # ======================================================
-    transform = transforms.Compose([
+    preprocess = transforms.Compose([
         transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],   # standard ImageNet
+            mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
         )
     ])
 
     # ======================================================
-    # LOAD SVHN
+    # LOAD RAW SVHN
     # ======================================================
-    trainset = datasets.SVHN(root="./data", split='train',
-                              download=True, transform=transform)
-    testset  = datasets.SVHN(root="./data", split='test',
-                              download=True, transform=transform)
+    raw_train = datasets.SVHN(root="./data", split='train',
+                              download=True, transform=None)
+    raw_test  = datasets.SVHN(root="./data", split='test',
+                              download=True, transform=None)
+
+    # ======================================================
+    # PREPROCESS SVHN INTO RAM  (🔥 key difference)
+    # ======================================================
+    print("\n=== Preprocessing SVHN into RAM (train) ===")
+    X_train, Y_train = [], []
+    for img, label in raw_train:
+        X_train.append(preprocess(img))
+        Y_train.append(label)
+
+    X_train = torch.stack(X_train, dim=0)
+    Y_train = torch.tensor(Y_train, dtype=torch.long)
+
+    print("Train RAM ready:", X_train.shape)
+
+    print("\n=== Preprocessing SVHN into RAM (test) ===")
+    X_test, Y_test = [], []
+    for img, label in raw_test:
+        X_test.append(preprocess(img))
+        Y_test.append(label)
+
+    X_test = torch.stack(X_test, dim=0)
+    Y_test = torch.tensor(Y_test, dtype=torch.long)
+
+    print("Test RAM ready:", X_test.shape)
+
+    # RAM datasets
+    trainRAM = RAMDataset(X_train, Y_train)
+    testRAM  = RAMDataset(X_test,  Y_test)
 
     testloader = DataLoader(
-        testset, batch_size=256, shuffle=False,
+        testRAM, batch_size=256, shuffle=False,
         num_workers=0, pin_memory=True
     )
 
     # ======================================================
-    # DIRICHLET SPLIT (usando dataset.labels)
+    # DIRICHLET SPLIT
     # ======================================================
-    def dirichlet_split(dataset, num_clients, alpha):
-        labels = np.array(dataset.labels)
+    def dirichlet_split(Y, num_clients, alpha):
+        labels = np.array(Y)
         num_classes = 10
         client_indices = [[] for _ in range(num_clients)]
 
@@ -123,19 +167,11 @@ def main():
     # FEDAVG
     # ======================================================
     def fedavg(states):
-
-        states_float = [
-            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
-             for k, v in st.items()}
-            for st in states
-        ]
-
         avg = {}
         with torch.no_grad():
-            for k in states_float[0].keys():
-                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
+            for k in states[0].keys():
+                stacked = torch.stack([s[k].float() for s in states], dim=0).to(DEVICE)
                 avg[k] = stacked.mean(dim=0)
-
         return avg
 
     # ======================================================
@@ -143,37 +179,33 @@ def main():
     # ======================================================
     def evaluate(model):
         model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        correct, total = 0, 0
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
             for x, y in testloader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
+                x = x.to(DEVICE)
+                y = y.to(DEVICE)
                 pred = model(x).argmax(1)
                 correct += (pred == y).sum().item()
                 total += y.size(0)
         return 100 * correct / total
 
     # ======================================================
-    # LOOP SU ALPHA
+    # MAIN FEDAVG LOOP
     # ======================================================
     for ALPHA in ALPHAS:
         print(f"\n============================")
         print(f"=== Dirichlet alpha = {ALPHA} ===")
         print(f"============================\n")
 
-        # Dirichlet split SVHN
-        client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
-
-        # modello globale
+        client_splits = dirichlet_split(Y_train, NUM_CLIENTS, ALPHA)
         global_model = build_resnet18().to(DEVICE)
 
-        # FEDAVG main loop
         for rnd in range(1, ROUNDS + 1):
             local_states = []
 
             for cid in range(NUM_CLIENTS):
-                subset = Subset(trainset, client_indices[cid])
+
+                subset = Subset(trainRAM, client_splits[cid])
                 loader = DataLoader(
                     subset,
                     batch_size=BATCH,
@@ -183,7 +215,7 @@ def main():
                 )
 
                 local_model = build_resnet18().to(DEVICE)
-                local_model.load_state_dict(global_model.state_dict(), strict=True)
+                local_model.load_state_dict(global_model.state_dict())
 
                 st = local_train(local_model, loader)
                 local_states.append(st)
@@ -194,8 +226,7 @@ def main():
             acc = evaluate(global_model)
             print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
-# ======================================================
-# ENTRYPOINT
-# ======================================================
+
+
 if __name__ == "__main__":
     main()
