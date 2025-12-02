@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, models
+from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 import random
@@ -13,10 +13,10 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.5]          # puoi mettere più alpha
+ALPHAS = [0.05, 0.1, 0.5]
 LOCAL_EPOCHS = 1
 BATCH = 256
-ROUNDS = 25
+ROUNDS = 100
 LR = 0.001
 SEED = 42
 
@@ -24,7 +24,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ======================================================
-# UTILITY
+# UTILITIES
 # ======================================================
 def seed_everything(s):
     random.seed(s)
@@ -35,204 +35,162 @@ def seed_everything(s):
 
 
 # ======================================================
-# FAST GPU PREPROCESS FOR CIFAR10
+# MODEL — ResNet18 PRETRAINED (TESTINA CIFAR-10)
 # ======================================================
-def preprocess_cifar10_to_ram(raw_dataset):
-    print(f"Preprocessing CIFAR-10 split '{raw_dataset.train}' into RAM (GPU accelerated)...")
+class ResNet18_C10_FULL(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-    # raw_dataset.data = np array HWC uint8
-    X = torch.from_numpy(raw_dataset.data)          # uint8 HWC
-    X = X.permute(0, 3, 1, 2).float() / 255.0       # NHWC -> NCHW float32
+        self.model = models.resnet18(pretrained=True)
 
-    Y = torch.tensor(raw_dataset.targets, dtype=torch.long)
+        # testina CIFAR-10
+        self.model.fc = nn.Linear(512, 10)
 
-    # move to GPU
-    X = X.to("cuda", non_blocking=True)
-
-    # Resize to 160x160
-    X = torch.nn.functional.interpolate(
-        X, size=(160, 160), mode="bilinear", align_corners=False
-    )
-
-    # Normalize (ImageNet stats)
-    mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
-    X = (X - mean) / std
-
-    # move back to CPU for slicing
-    X = X.cpu()
-
-    print(f"Done preprocessing {len(X)} images.")
-    return X, Y
+    def forward(self, x):
+        return self.model(x)
 
 
 # ======================================================
-# DATASET WRAPPER
+# LOCAL TRAIN
 # ======================================================
-class CIFAR10RAM(torch.utils.data.Dataset):
-    def __init__(self, X, Y):
-        self.X = X
-        self.Y = Y
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    def __len__(self):
-        return len(self.X)
+def local_train(local_model, loader):
+    local_model.train()
+    opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
+    loss_fn = nn.CrossEntropyLoss()
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
+    for _ in range(LOCAL_EPOCHS):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                loss = loss_fn(local_model(x), y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+    return local_model.state_dict()
+
+
+# ======================================================
+# FEDAVG
+# ======================================================
+def fedavg(states):
+    avg = {}
+    with torch.no_grad():
+        for k in states[0]:
+            tensors = [s[k] for s in states]
+
+            if tensors[0].dtype in [torch.float16, torch.float32, torch.float64]:
+                stacked = torch.stack(tensors, dim=0).to(DEVICE)
+                avg[k] = stacked.mean(dim=0)
+            else:
+                avg[k] = tensors[0].clone().to(DEVICE)
+
+    return avg
+
+
+# ======================================================
+# EVALUATION
+# ======================================================
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return 100 * correct / total
+
+
+# ======================================================
+# DIRICHLET SPLIT
+# ======================================================
+def dirichlet_split(labels, num_clients, alpha):
+    labels = np.array(labels)
+    num_classes = len(np.unique(labels))
+    client_indices = [[] for _ in range(num_clients)]
+
+    for c in range(num_classes):
+        idx = np.where(labels == c)[0]
+        np.random.shuffle(idx)
+
+        props = np.random.dirichlet([alpha] * num_clients)
+        props = (props * len(idx)).astype(int)
+
+        while props.sum() < len(idx):
+            props[np.argmax(props)] += 1
+
+        start = 0
+        for i in range(num_clients):
+            end = start + props[i]
+            client_indices[i].extend(idx[start:end])
+            start = end
+
+    return client_indices
 
 
 # ======================================================
 # MAIN
 # ======================================================
 def main():
-
     seed_everything(SEED)
 
-    # ------------------------------
-    # Load raw CIFAR10
-    # ------------------------------
-    raw_train = datasets.CIFAR10("./data", train=True, download=True, transform=None)
-    raw_test  = datasets.CIFAR10("./data", train=False, download=True, transform=None)
+    # ✔ TRASFORMAZIONI IDENTICHE AL CODICE LENTO → stessa accuracy
+    transform = transforms.Compose([
+        transforms.Resize(160),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.4914, 0.4822, 0.4465),   # CIFAR-10 mean/std
+            std=(0.2470, 0.2435, 0.2616)
+        )
+    ])
 
-    # ------------------------------
-    # FAST GPU PREPROCESS
-    # ------------------------------
-    X_train, Y_train = preprocess_cifar10_to_ram(raw_train)
-    X_test,  Y_test  = preprocess_cifar10_to_ram(raw_test)
+    train_raw = datasets.CIFAR10("./data", train=True, download=True, transform=transform)
+    test_raw  = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
 
-    trainset = CIFAR10RAM(X_train, Y_train)
-    testset  = CIFAR10RAM(X_test,  Y_test)
+    testloader = DataLoader(test_raw, batch_size=BATCH, shuffle=False,
+                            num_workers=2, pin_memory=True)
 
-    testloader = DataLoader(
-        testset, batch_size=BATCH, shuffle=False,
-        num_workers=0, pin_memory=True
-    )
+    labels_train = train_raw.targets
 
-    # ======================================================
-    # DIRICHLET SPLIT
-    # ======================================================
-    def dirichlet_split(labels, num_clients, alpha):
-        num_classes = 10
-        labels = np.array(labels)
-        client_indices = [[] for _ in range(num_clients)]
-
-        for c in range(num_classes):
-            idx = np.where(labels == c)[0]
-            np.random.shuffle(idx)
-
-            props = np.random.dirichlet([alpha] * num_clients)
-            props = (props * len(idx)).astype(int)
-
-            while props.sum() < len(idx):
-                props[np.argmax(props)] += 1
-
-            start = 0
-            for i in range(num_clients):
-                end = start + props[i]
-                client_indices[i].extend(idx[start:end])
-                start = end
-
-        return client_indices
-
-    # ======================================================
-    # MODEL FACTORY
-    # ======================================================
-    def build_resnet18():
-        model = models.resnet18(pretrained=True)
-        model.fc = nn.Linear(512, 10)
-        return model
-
-    # ======================================================
-    # LOCAL TRAIN
-    # ======================================================
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
-    def local_train(local_model, loader):
-        local_model.train()
-        opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
-        loss_fn = nn.CrossEntropyLoss()
-
-        for _ in range(LOCAL_EPOCHS):
-            for x, y in loader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-
-                opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    loss = loss_fn(local_model(x), y)
-
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-
-        return local_model.state_dict()
-
-    # ======================================================
-    # FEDAVG
-    # ======================================================
-    def fedavg(states):
-        states_float = [
-            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
-             for k, v in st.items()}
-            for st in states
-        ]
-
-        avg = {}
-        with torch.no_grad():
-            for k in states_float[0].keys():
-                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
-                avg[k] = stacked.mean(dim=0)
-
-        return avg
-
-    # ======================================================
-    # EVALUATION
-    # ======================================================
-    def evaluate(model):
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            for x, y in testloader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-                pred = model(x).argmax(1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-        return 100 * correct / total
-
-    # ======================================================
-    # LOOP SU ALPHA
-    # ======================================================
     for ALPHA in ALPHAS:
-
         print("\n============================")
         print(f"=== Dirichlet alpha = {ALPHA} ===")
-        print("============================\n")
+        print("============================")
 
-        client_indices = dirichlet_split(Y_train, NUM_CLIENTS, ALPHA)
-        global_model = build_resnet18().to(DEVICE)
+        # nuovo modello globale
+        global_model = ResNet18_C10_FULL().to(DEVICE)
+
+        # split clienti
+        client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
 
         for rnd in range(1, ROUNDS + 1):
             local_states = []
 
             for cid in range(NUM_CLIENTS):
-                subset = Subset(trainset, client_indices[cid])
-                loader = DataLoader(
-                    subset, batch_size=BATCH, shuffle=True,
-                    num_workers=0, pin_memory=True
-                )
+                subset = Subset(train_raw, client_indices[cid])
+                loader = DataLoader(subset, batch_size=BATCH, shuffle=True,
+                                    num_workers=2, pin_memory=True)
 
-                local_model = build_resnet18().to(DEVICE)
+                local_model = ResNet18_C10_FULL().to(DEVICE)
                 local_model.load_state_dict(global_model.state_dict(), strict=True)
 
-                st = local_train(local_model, loader)
-                local_states.append(st)
+                state = local_train(local_model, loader)
+                local_states.append(state)
 
             new_state = fedavg(local_states)
             global_model.load_state_dict(new_state)
 
-            acc = evaluate(global_model)
+            acc = evaluate(global_model, testloader)
             print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
 
