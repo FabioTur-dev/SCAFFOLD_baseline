@@ -13,10 +13,10 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHA = 0.5
+ALPHAS = [0.05, 0.1]   # <--- qui le due alpha
 LOCAL_EPOCHS = 1
-BATCH = 128
-ROUNDS = 10
+BATCH = 256
+ROUNDS = 25
 LR = 0.001
 SEED = 42
 
@@ -84,8 +84,6 @@ def main():
 
         return client_indices
 
-    client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
-
     # ======================================================
     # MODEL FACTORY
     # ======================================================
@@ -93,8 +91,6 @@ def main():
         model = models.resnet18(pretrained=True)
         model.fc = nn.Linear(512, 10)
         return model
-
-    global_model = build_resnet18().to(DEVICE)
 
     # ======================================================
     # LOCAL TRAIN
@@ -126,7 +122,6 @@ def main():
     # ======================================================
     def fedavg(states):
 
-        # convert ALL states to float to avoid LongTensor mean error
         states_float = [
             {k: v.float() if v.dtype in (torch.int64, torch.long) else v
              for k, v in st.items()}
@@ -158,36 +153,49 @@ def main():
         return 100 * correct / total
 
     # ======================================================
-    # FEDAVG MAIN LOOP
+    # LOOP SU TUTTE LE ALPHA
     # ======================================================
-    for rnd in range(1, ROUNDS + 1):
-        local_states = []
+    for ALPHA in ALPHAS:
+        print(f"\n============================")
+        print(f"=== Dirichlet alpha = {ALPHA} ===")
+        print(f"============================\n")
 
-        for cid in range(NUM_CLIENTS):
-            subset = Subset(trainset, client_indices[cid])
-            loader = DataLoader(
-                subset,
-                batch_size=BATCH,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=True
-            )
+        # nuovo split per questa alpha
+        client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
 
-            local_model = build_resnet18().to(DEVICE)
-            local_model.load_state_dict(global_model.state_dict(), strict=True)
+        # nuovo modello globale per questa alpha
+        global_model = build_resnet18().to(DEVICE)
 
-            st = local_train(local_model, loader)
-            local_states.append(st)
+        # FEDAVG MAIN LOOP
+        for rnd in range(1, ROUNDS + 1):
+            local_states = []
 
-        new_state = fedavg(local_states)
-        global_model.load_state_dict(new_state)
+            for cid in range(NUM_CLIENTS):
+                subset = Subset(trainset, client_indices[cid])
+                loader = DataLoader(
+                    subset,
+                    batch_size=BATCH,
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=True
+                )
 
-        acc = evaluate(global_model)
-        print(f"[ROUND {rnd}] ACC = {acc:.2f}%")
+                local_model = build_resnet18().to(DEVICE)
+                local_model.load_state_dict(global_model.state_dict(), strict=True)
+
+                st = local_train(local_model, loader)
+                local_states.append(st)
+
+            new_state = fedavg(local_states)
+            global_model.load_state_dict(new_state)
+
+            acc = evaluate(global_model)
+            print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
 
 # ======================================================
-# WINDOWS GUARD
+# WINDOWS / ENTRY GUARD
 # ======================================================
 if __name__ == "__main__":
     main()
+
