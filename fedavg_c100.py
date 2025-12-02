@@ -13,16 +13,18 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.05, 0.1, 0.5]   # <--- qui le due alpha
+ALPHAS = [0.5, 0.1, 0.05]
 LOCAL_EPOCHS = 1
 BATCH = 256
-ROUNDS = 25
+ROUNDS = 100
 LR = 0.001
 SEED = 42
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
+# ======================================================
+# UTILITIES
+# ======================================================
 def seed_everything(s):
     random.seed(s)
     np.random.seed(s)
@@ -30,166 +32,166 @@ def seed_everything(s):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
 
+# ======================================================
+# MODEL 32×32 FRIENDLY RESNET-18 (per CIFAR-100)
+# ======================================================
+class ResNet18_C100(nn.Module):
+    def __init__(self):
+        super().__init__()
 
+        self.model = models.resnet18(pretrained=True)
+
+        # conv1 adattata a 32×32
+        self.model.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        # niente maxpool
+        self.model.maxpool = nn.Identity()
+
+        # 100 classi CIFAR-100
+        self.model.fc = nn.Linear(512, 100)
+
+    def forward(self, x):
+        return self.model(x)
+
+# ======================================================
+# LOCAL TRAIN
+# ======================================================
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+
+def local_train(local_model, loader):
+    local_model.train()
+    opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
+    loss_fn = nn.CrossEntropyLoss()
+
+    for _ in range(LOCAL_EPOCHS):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                loss = loss_fn(local_model(x), y)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+    return local_model.state_dict()
+
+# ======================================================
+# FEDAVG
+# ======================================================
+def fedavg(states):
+    avg = {}
+    with torch.no_grad():
+        for k in states[0]:
+            tensors = [s[k] for s in states]
+
+            if tensors[0].dtype in [torch.float16, torch.float32, torch.float64]:
+                stacked = torch.stack(tensors, dim=0).to(DEVICE)
+                avg[k] = stacked.mean(dim=0)
+            else:
+                avg[k] = tensors[0].clone().to(DEVICE)
+
+    return avg
+
+# ======================================================
+# EVALUATION
+# ======================================================
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+    return 100 * correct / total
+
+# ======================================================
+# DIRICHLET SPLIT
+# ======================================================
+def dirichlet_split(labels, num_clients, alpha):
+    labels = np.array(labels)
+    num_classes = len(np.unique(labels))
+    client_indices = [[] for _ in range(num_clients)]
+
+    for c in range(num_classes):
+        idx = np.where(labels == c)[0]
+        np.random.shuffle(idx)
+
+        props = np.random.dirichlet([alpha] * num_clients)
+        props = (props * len(idx)).astype(int)
+
+        while props.sum() < len(idx):
+            props[np.argmax(props)] += 1
+
+        start = 0
+        for i in range(num_clients):
+            end = start + props[i]
+            client_indices[i].extend(idx[start:end])
+            start = end
+
+    return client_indices
+
+# ======================================================
+# MAIN
+# ======================================================
 def main():
-
     seed_everything(SEED)
 
-    # ======================================================
-    # FAST TRANSFORMS
-    # ======================================================
+    # CIFAR-100 normalization
     transform = transforms.Compose([
-        transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=[0.5071, 0.4867, 0.4408],    # CIFAR-100 mean
-            std=[0.2675, 0.2565, 0.2761]      # CIFAR-100 std
+            mean=(0.5071, 0.4867, 0.4408),
+            std=(0.2675, 0.2565, 0.2761)
         )
     ])
 
-    # ======================================================
-    # LOAD CIFAR-100
-    # ======================================================
-    trainset = datasets.CIFAR100("./data", train=True, download=True, transform=transform)
-    testset  = datasets.CIFAR100("./data", train=False, download=True, transform=transform)
+    train_raw = datasets.CIFAR100("./data", train=True, download=True, transform=transform)
+    test_raw  = datasets.CIFAR100("./data", train=False, download=True, transform=transform)
 
-    testloader = DataLoader(
-        testset, batch_size=256, shuffle=False,
-        num_workers=0, pin_memory=True
-    )
+    testloader = DataLoader(test_raw, batch_size=BATCH, shuffle=False,
+                            num_workers=2, pin_memory=True)
 
-    # ======================================================
-    # DIRICHLET SPLIT (per 100 classi)
-    # ======================================================
-    def dirichlet_split(dataset, num_clients, alpha):
-        labels = np.array(dataset.targets)
-        num_classes = 100
-        client_indices = [[] for _ in range(num_clients)]
+    labels_train = train_raw.targets  # CIFAR-100 labels
 
-        for c in range(num_classes):
-            idx = np.where(labels == c)[0]
-            np.random.shuffle(idx)
-
-            props = np.random.dirichlet([alpha] * num_clients)
-            props = (props * len(idx)).astype(int)
-
-            while props.sum() < len(idx):
-                props[np.argmax(props)] += 1
-
-            start = 0
-            for i in range(num_clients):
-                end = start + props[i]
-                client_indices[i].extend(idx[start:end])
-                start = end
-
-        return client_indices
-
-    # ======================================================
-    # MODEL FACTORY — adattato per 100 classi
-    # ======================================================
-    def build_resnet18():
-        model = models.resnet18(pretrained=True)
-        model.fc = nn.Linear(512, 100)   # <--- CIFAR-100
-        return model
-
-    # ======================================================
-    # LOCAL TRAIN
-    # ======================================================
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
-    def local_train(local_model, loader):
-        local_model.train()
-        opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
-        loss_fn = nn.CrossEntropyLoss()
-
-        for _ in range(LOCAL_EPOCHS):
-            for x, y in loader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-
-                opt.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    loss = loss_fn(local_model(x), y)
-
-                scaler.scale(loss).backward()
-                scaler.step(opt)
-                scaler.update()
-
-        return local_model.state_dict()
-
-    # ======================================================
-    # FEDAVG FIXED
-    # ======================================================
-    def fedavg(states):
-
-        states_float = [
-            {k: v.float() if v.dtype in (torch.int64, torch.long) else v
-             for k, v in st.items()}
-            for st in states
-        ]
-
-        avg = {}
-        with torch.no_grad():
-            for k in states_float[0].keys():
-                stacked = torch.stack([s[k] for s in states_float], dim=0).to(DEVICE)
-                avg[k] = stacked.mean(dim=0)
-
-        return avg
-
-    # ======================================================
-    # EVALUATION
-    # ======================================================
-    def evaluate(model):
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-            for x, y in testloader:
-                x = x.to(DEVICE, non_blocking=True)
-                y = y.to(DEVICE, non_blocking=True)
-                pred = model(x).argmax(1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
-        return 100 * correct / total
-
-    # ======================================================
-    # LOOP SU TUTTE LE ALPHA
-    # ======================================================
     for ALPHA in ALPHAS:
-        print(f"\n============================")
+        print("\n============================")
         print(f"=== Dirichlet alpha = {ALPHA} ===")
-        print(f"============================\n")
+        print("============================")
 
-        client_indices = dirichlet_split(trainset, NUM_CLIENTS, ALPHA)
-        global_model = build_resnet18().to(DEVICE)
+        global_model = ResNet18_C100().to(DEVICE)
 
-        # MAIN FEDAVG
+        client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
+
         for rnd in range(1, ROUNDS + 1):
             local_states = []
 
             for cid in range(NUM_CLIENTS):
-                subset = Subset(trainset, client_indices[cid])
-                loader = DataLoader(
-                    subset,
-                    batch_size=BATCH,
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=True
-                )
+                subset = Subset(train_raw, client_indices[cid])
+                loader = DataLoader(subset, batch_size=BATCH, shuffle=True,
+                                    num_workers=2, pin_memory=True)
 
-                local_model = build_resnet18().to(DEVICE)
+                local_model = ResNet18_C100().to(DEVICE)
                 local_model.load_state_dict(global_model.state_dict(), strict=True)
 
-                st = local_train(local_model, loader)
-                local_states.append(st)
+                state = local_train(local_model, loader)
+                local_states.append(state)
 
             new_state = fedavg(local_states)
             global_model.load_state_dict(new_state)
 
-            acc = evaluate(global_model)
+            acc = evaluate(global_model, testloader)
             print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
-
-
+# ======================================================
+# ENTRYPOINT
+# ======================================================
 if __name__ == "__main__":
     main()
