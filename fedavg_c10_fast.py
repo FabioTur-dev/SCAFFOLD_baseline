@@ -42,8 +42,6 @@ class ResNet18_C10_FULL(nn.Module):
         super().__init__()
 
         self.model = models.resnet18(pretrained=True)
-
-        # testina CIFAR-10
         self.model.fc = nn.Linear(512, 10)
 
     def forward(self, x):
@@ -77,19 +75,26 @@ def local_train(local_model, loader):
 
 
 # ======================================================
-# FEDAVG
+# FEDAVG PESATO (CORRETTO)
 # ======================================================
-def fedavg(states):
+def fedavg_weighted(states, client_sizes):
     avg = {}
+    total = sum(client_sizes)
+
     with torch.no_grad():
         for k in states[0]:
-            tensors = [s[k] for s in states]
+            tensors = [s[k].to(DEVICE) for s in states]
 
             if tensors[0].dtype in [torch.float16, torch.float32, torch.float64]:
-                stacked = torch.stack(tensors, dim=0).to(DEVICE)
-                avg[k] = stacked.mean(dim=0)
+                # weighted sum
+                w_avg = sum(
+                    (client_sizes[i] / total) * tensors[i]
+                    for i in range(len(states))
+                )
+                avg[k] = w_avg
             else:
-                avg[k] = tensors[0].clone().to(DEVICE)
+                # non-float tensors -> just copy
+                avg[k] = tensors[0].clone()
 
     return avg
 
@@ -144,12 +149,11 @@ def dirichlet_split(labels, num_clients, alpha):
 def main():
     seed_everything(SEED)
 
-    # ✔ TRASFORMAZIONI IDENTICHE AL CODICE LENTO → stessa accuracy
     transform = transforms.Compose([
         transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=(0.4914, 0.4822, 0.4465),   # CIFAR-10 mean/std
+            mean=(0.4914, 0.4822, 0.4465),
             std=(0.2470, 0.2435, 0.2616)
         )
     ])
@@ -167,11 +171,11 @@ def main():
         print(f"=== Dirichlet alpha = {ALPHA} ===")
         print("============================")
 
-        # nuovo modello globale
         global_model = ResNet18_C10_FULL().to(DEVICE)
 
         # split clienti
         client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
+        client_sizes = [len(idx) for idx in client_indices]   # REQUIRED FOR WEIGHTED FEDAVG
 
         for rnd in range(1, ROUNDS + 1):
             local_states = []
@@ -187,7 +191,9 @@ def main():
                 state = local_train(local_model, loader)
                 local_states.append(state)
 
-            new_state = fedavg(local_states)
+            # FedAvg pesato (corretto, come da paper)
+            new_state = fedavg_weighted(local_states, client_sizes)
+
             global_model.load_state_dict(new_state)
 
             acc = evaluate(global_model, testloader)
