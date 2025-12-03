@@ -117,12 +117,18 @@ axins.set_ylim(65, 85)
 axins.grid(which="major", color="#D9DDE8", lw=0.6)
 
 axins.plot(rounds, acc_a005, lw=1.0, color=color_005)
-axins.scatter(rounds, acc_a005, s=30, marker="^",
-              facecolor="white", edgecolor=color_005, linewidth=0.9)
+axins.scatter(
+    rounds, acc_a005,
+    s=30, marker="^",
+    facecolor="white", edgecolor=color_005, linewidth=0.9
+)
 
 axins.plot(rounds, acc_a01, lw=1.0, color=color_01)
-axins.scatter(rounds, acc_a01, s=30, marker="s",
-              facecolor="white", edgecolor=color_01, linewidth=0.9)
+axins.scatter(
+    rounds, acc_a01,
+    s=30, marker="s",
+    facecolor="white", edgecolor=color_01, linewidth=0.9
+)
 
 for spine in ["top", "right"]:
     axins.spines[spine].set_visible(False)
@@ -160,5 +166,16 @@ legend.get_frame().set_facecolor("white")
 legend.get_frame().set_edgecolor("#D0D5E3")
 
 plt.tight_layout()
+
+# ==========================================
+#  EXPORT VETTORIALE PDF
+# ==========================================
+plt.savefig(
+    "fedavg_dirichlet_legend_left_of_inset.pdf",
+    format="pdf",
+    bbox_inches="tight"
+)
+
 plt.show()
-# plt.savefig("fedavg_dirichlet_legend_left_of_inset.png", bbox_inches="tight")
+# oppure, se non ti serve la finestra:
+# plt.close()
