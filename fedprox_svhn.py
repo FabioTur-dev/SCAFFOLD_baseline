@@ -60,7 +60,6 @@ def local_train_fedprox(local_model, global_model, loader, mu=FEDPROX_MU):
     opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    # snapshot dei pesi globali per il termine di prossimità
     global_params = {
         name: p.detach().clone()
         for name, p in global_model.named_parameters()
@@ -76,7 +75,6 @@ def local_train_fedprox(local_model, global_model, loader, mu=FEDPROX_MU):
                 preds = local_model(x)
                 loss = loss_fn(preds, y)
 
-                # ----- termine proximal FedProx -----
                 prox = 0.0
                 for name, param in local_model.named_parameters():
                     prox += ((param - global_params[name].to(DEVICE)) ** 2).sum()
@@ -128,30 +126,35 @@ def evaluate(model, loader):
     return 100 * correct / total
 
 # ======================================================
-# DIRICHLET SPLIT
+# DIRICHLET SPLIT — VERSIONE MIGLIORATA (mai client vuoti)
 # ======================================================
 def dirichlet_split(labels, num_clients, alpha):
     labels = np.array(labels)
     num_classes = len(np.unique(labels))
-    client_indices = [[] for _ in range(num_clients)]
 
-    for c in range(num_classes):
-        idx = np.where(labels == c)[0]
-        np.random.shuffle(idx)
+    while True:  # ripeti finché nessun client è vuoto
+        client_indices = [[] for _ in range(num_clients)]
 
-        props = np.random.dirichlet([alpha] * num_clients)
-        props = (props * len(idx)).astype(int)
+        for c in range(num_classes):
+            idx = np.where(labels == c)[0]
+            np.random.shuffle(idx)
 
-        while props.sum() < len(idx):
-            props[np.argmax(props)] += 1
+            props = np.random.dirichlet([alpha] * num_clients)
+            props = (props * len(idx)).astype(int)
 
-        start = 0
-        for i in range(num_clients):
-            end = start + props[i]
-            client_indices[i].extend(idx[start:end])
-            start = end
+            while props.sum() < len(idx):
+                props[np.argmax(props)] += 1
 
-    return client_indices
+            start = 0
+            for i in range(num_clients):
+                end = start + props[i]
+                client_indices[i].extend(idx[start:end])
+                start = end
+
+        # condizione di uscita: nessun client vuoto
+        if all(len(ci) > 0 for ci in client_indices):
+            return client_indices
+        # altrimenti ripeti
 
 # ======================================================
 # MAIN
@@ -196,11 +199,9 @@ def main():
                 local_model = ResNet18_SVHN().to(DEVICE)
                 local_model.load_state_dict(global_model.state_dict(), strict=True)
 
-                # FedProx local training
                 state = local_train_fedprox(local_model, global_model, loader)
                 local_states.append(state)
 
-            # Aggregazione FedAvg pesata
             new_state = fedavg_weighted(local_states, client_sizes)
             global_model.load_state_dict(new_state)
 
