@@ -16,11 +16,10 @@ NUM_CLIENTS = 10
 ALPHAS = [0.05, 0.1, 0.5]
 LOCAL_EPOCHS = 1
 BATCH = 256
-ROUNDS = 100
+ROUNDS = 50
 LR = 0.001
 SEED = 42
 
-# Valore "neutro" tipico in letteratura FedProx (usato spessissimo)
 FEDPROX_MU = 0.01
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -38,14 +37,13 @@ def seed_everything(s):
 
 
 # ======================================================
-# MODEL — ResNet18 PRETRAINED (TESTINA CIFAR-10)
+# MODEL — ResNet18 CIFAR-10
 # ======================================================
 class ResNet18_C10_FULL(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.model = models.resnet18(pretrained=True)
-        self.model.fc = nn.Linear(512, 10)  # 10 classi CIFAR-10
+        self.model.fc = nn.Linear(512, 10)
 
     def forward(self, x):
         return self.model(x)
@@ -61,7 +59,6 @@ def local_train_fedprox(local_model, global_model, loader, mu=FEDPROX_MU):
     opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    # Congela i pesi globali per il termine di prossimità
     global_params = {k: v.detach().clone() for k, v in global_model.state_dict().items()}
 
     for _ in range(LOCAL_EPOCHS):
@@ -75,7 +72,7 @@ def local_train_fedprox(local_model, global_model, loader, mu=FEDPROX_MU):
                 preds = local_model(x)
                 loss = loss_fn(preds, y)
 
-                # ----- FedProx proximal term -----
+                # Proximal term
                 prox = 0.0
                 for (name, param) in local_model.named_parameters():
                     prox += ((param - global_params[name].to(DEVICE)) ** 2).sum()
@@ -89,19 +86,24 @@ def local_train_fedprox(local_model, global_model, loader, mu=FEDPROX_MU):
 
 
 # ======================================================
-# FEDAVG (server aggregation, unchanged)
+# FEDAVG WEIGHTED (CORRETTO)
 # ======================================================
-def fedavg(states):
+def fedavg_weighted(states, client_sizes):
     avg = {}
+    total = sum(client_sizes)
+
     with torch.no_grad():
         for k in states[0]:
-            tensors = [s[k] for s in states]
+            tensors = [s[k].to(DEVICE) for s in states]
 
             if tensors[0].dtype in [torch.float16, torch.float32, torch.float64]:
-                stacked = torch.stack(tensors, dim=0).to(DEVICE)
-                avg[k] = stacked.mean(dim=0)
+                weighted = sum(
+                    (client_sizes[i] / total) * tensors[i]
+                    for i in range(len(tensors))
+                )
+                avg[k] = weighted
             else:
-                avg[k] = tensors[0].clone().to(DEVICE)
+                avg[k] = tensors[0].clone()
 
     return avg
 
@@ -160,7 +162,7 @@ def main():
         transforms.Resize(160),
         transforms.ToTensor(),
         transforms.Normalize(
-            mean=(0.4914, 0.4822, 0.4465),  # CIFAR-10 mean/std
+            mean=(0.4914, 0.4822, 0.4465),
             std=(0.2470, 0.2435, 0.2616)
         )
     ])
@@ -181,6 +183,7 @@ def main():
         global_model = ResNet18_C10_FULL().to(DEVICE)
 
         client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
+        client_sizes = [len(idx) for idx in client_indices]   # 👈 NECESSARIO
 
         for rnd in range(1, ROUNDS + 1):
             local_states = []
@@ -196,7 +199,9 @@ def main():
                 state = local_train_fedprox(local_model, global_model, loader)
                 local_states.append(state)
 
-            new_state = fedavg(local_states)
+            # FedAvg pesato (corretto!)
+            new_state = fedavg_weighted(local_states, client_sizes)
+
             global_model.load_state_dict(new_state)
 
             acc = evaluate(global_model, testloader)
@@ -208,3 +213,4 @@ def main():
 # ======================================================
 if __name__ == "__main__":
     main()
+

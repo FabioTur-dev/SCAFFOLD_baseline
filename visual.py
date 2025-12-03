@@ -32,7 +32,7 @@ acc_a01 = np.array([
 mpl.rcParams["figure.dpi"] = 220
 mpl.rcParams["savefig.dpi"] = 220
 mpl.rcParams["font.family"] = "DejaVu Sans"
-mpl.rcParams["font.size"] = 10
+mpl.rcParams["font.size"] = 11  # un po' più grande
 
 fig, ax = plt.subplots(figsize=(6.8, 3.6))
 ax.set_facecolor("#F7F8FB")
@@ -84,30 +84,32 @@ ax.scatter(
 
 # ==========================================
 #  LABEL NUMERICI SOLO OGNI 5 ROUND
+#  (numeri un po' più grandi)
 # ==========================================
 for x, y in zip(rounds[::5], acc_a005[::5]):
     ax.text(
         x, y + 1.6, f"{y:.1f}",
-        ha="center", fontsize=8.0, color="#334",
+        ha="center", fontsize=9.0, color="#334",
         path_effects=[withStroke(linewidth=2, foreground="white")]
     )
 
 for x, y in zip(rounds[::5], acc_a01[::5]):
     ax.text(
         x, y + 1.6, f"{y:.1f}",
-        ha="center", fontsize=8.0, color="#533",
+        ha="center", fontsize=9.0, color="#533",
         path_effects=[withStroke(linewidth=2, foreground="white")]
     )
 
 # ==========================================
 #  MINI-CHART (INSET) (20–25)
+#  -> leggermente più in alto (borderpad 1.3)
 # ==========================================
 axins = inset_axes(
     ax,
     width="22%",
     height="38%",
     loc="lower right",
-    borderpad=1.0
+    borderpad=1.3   # prima era 1.0: così sale un po' e non interseca l'asse x
 )
 axins.set_facecolor("#F4F6FB")
 
@@ -137,13 +139,16 @@ axins.set_xticks([20, 22, 24])
 axins.set_yticks([70, 75, 80])
 
 # ==========================================
-#  TITOLI, ASSI
+#  TITOLI, ASSI (font più grandi)
 # ==========================================
 ax.set_title("FedAvg on CIFAR-10 with Dirichlet client splits",
-             fontsize=11, weight="normal", color="#222")
+             fontsize=12, weight="normal", color="#222")
 
-ax.set_xlabel("Communication Round")
-ax.set_ylabel("Top-1 Accuracy (%)")
+ax.set_xlabel("Communication Round", fontsize=12)
+ax.set_ylabel("Top-1 Accuracy (%)", fontsize=12)
+
+# tick label un filo più grandi
+ax.tick_params(axis='both', labelsize=11)
 
 for spine in ["top", "right"]:
     ax.spines[spine].set_visible(False)
@@ -155,8 +160,8 @@ for spine in ["top", "right"]:
 legend = ax.legend(
     frameon=True,
     fontsize=9,
-    loc="center right",          # ancorata sul lato destro della legenda
-    bbox_to_anchor=(0.70, 0.27), # x<1 ⇒ dentro l'asse, poco a sinistra dell'inset
+    loc="center right",
+    bbox_to_anchor=(0.70, 0.30),  # leggera correzione in su per seguire l'inset
     ncol=1,
     borderpad=0.5,
     handlelength=2.2,
@@ -167,9 +172,7 @@ legend.get_frame().set_edgecolor("#D0D5E3")
 
 plt.tight_layout()
 
-# ==========================================
-#  EXPORT VETTORIALE PDF
-# ==========================================
+# Export PDF vettoriale
 plt.savefig(
     "fedavg_dirichlet_legend_left_of_inset.pdf",
     format="pdf",
@@ -177,5 +180,3 @@ plt.savefig(
 )
 
 plt.show()
-# oppure, se non ti serve la finestra:
-# plt.close()
