@@ -13,10 +13,10 @@ import random
 # CONFIG
 # ======================================================
 NUM_CLIENTS = 10
-ALPHAS = [0.5]
+ALPHAS = [0.1, 0.05]
 LOCAL_EPOCHS = 1
 BATCH = 256
-ROUNDS = 100
+ROUNDS = 50
 LR = 0.001
 SEED = 42
 
