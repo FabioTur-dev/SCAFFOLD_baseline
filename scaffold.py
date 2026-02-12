@@ -1,293 +1,299 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+SCAFFOLD (CIFAR-10) — fully comparable with FedAvg/FedProx
+Includes:
+- weighted aggregation
+- correct BN buffer aggregation
+- identical training hyperparameters
+"""
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, Subset
 
 # ======================================================
-# CONFIG
+# CONFIG (IDENTICI)
 # ======================================================
-
 NUM_CLIENTS = 10
-DIR_ALPHAS = [0.1, 0.5]
-NUM_ROUNDS = 20
-LOCAL_EPOCHS = 2
-BATCH = 128
-
-LR_INIT = 0.01
-LR_DECAY_ROUND = 15
-LR_DECAY = 0.003
-
-BETA = 0.01
-DAMPING = 0.1
-GRAD_CLIP = 5.0
+ALPHAS = [0.5, 0.1, 0.05]
+LOCAL_EPOCHS = 1
+BATCH = 256
+ROUNDS = 50
+LR = 0.001
 SEED = 42
 
-IMG_SIZE = 160
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-def set_seed(s):
+# ======================================================
+# SEED
+# ======================================================
+def seed_everything(s):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
-
-
-def log(x):
-    print(x, flush=True)
-
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
 
 # ======================================================
-# GPU AUGMENT
+# MODEL — CIFAR-10
 # ======================================================
-
-def gpu_augment(x):
-    if torch.rand(1) < 0.5:
-        x = torch.flip(x, dims=[3])
-    return x
-
-
-# ======================================================
-# DIRICHLET SPLIT
-# ======================================================
-
-def dirichlet_split(labels, n_clients, alpha):
-    labels_np = labels.numpy()
-    per = [[] for _ in range(n_clients)]
-    classes = np.unique(labels_np)
-
-    for c in classes:
-        idx = np.where(labels_np == c)[0]
-        np.random.shuffle(idx)
-        p = np.random.dirichlet([alpha] * n_clients)
-        cuts = (np.cumsum(p) * len(idx)).astype(int)
-        chunks = np.split(idx, cuts[:-1])
-        for cid in range(n_clients):
-            per[cid].extend(chunks[cid])
-
-    for cid in range(n_clients):
-        if len(per[cid]) == 0:
-            per[cid].append(np.random.randint(0, len(labels_np)))
-
-    for cid in range(n_clients):
-        random.shuffle(per[cid])
-
-    return per
-
-
-# ======================================================
-# RESNET18 PRETRAINED (download automatico)
-# only layer3 + layer4 + fc are trainable
-# ======================================================
-
-class ResNet18Pre(nn.Module):
-    def __init__(self, nc):
+class ResNet18_C10(nn.Module):
+    def __init__(self):
         super().__init__()
-
-        # Compatibile con tutte le versioni di torchvision
-        try:
-            self.m = models.resnet18(weights="IMAGENET1K_V1")
-        except:
-            try:
-                self.m = models.resnet18(pretrained=True)
-            except:
-                self.m = models.resnet18()
-
-        in_f = self.m.fc.in_features
-        self.m.fc = nn.Linear(in_f, nc)
-
-        for p in self.m.parameters():
-            p.requires_grad = False
-
-        for name, p in self.m.named_parameters():
-            if name.startswith("layer3") or name.startswith("layer4") or name.startswith("fc"):
-                p.requires_grad = True
+        self.model = models.resnet18(pretrained=True)
+        self.model.fc = nn.Linear(512, 10)
 
     def forward(self, x):
-        return self.m(x)
-
+        return self.model(x)
 
 # ======================================================
-# LOCAL TRAINING
+# PARAM HELPERS
 # ======================================================
+def get_param_dict(model):
+    return {name: p for name, p in model.named_parameters()}
 
-def run_client(model, idxs, X_cpu, y_cpu, c_global, c_local, lr, device):
-    model.train()
-    params = [p for p in model.parameters() if p.requires_grad]
+def get_param_tensor_dict(model):
+    return {name: p.detach().clone() for name, p in model.named_parameters()}
 
-    old_params = [p.detach().clone() for p in params]
+# ======================================================
+# AMP
+# ======================================================
+scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    opt = optim.SGD(params, lr=lr, momentum=0.9)
+# ======================================================
+# LOCAL TRAIN — SCAFFOLD
+# ======================================================
+def local_train_scaffold(local_model, global_model, c_local, c_global, loader):
+    local_model.train()
+    opt = optim.SGD(local_model.parameters(), lr=LR, momentum=0.9)
     loss_fn = nn.CrossEntropyLoss()
 
-    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1, 3, 1, 1)
+    global_params = get_param_tensor_dict(global_model)
 
     for _ in range(LOCAL_EPOCHS):
-        for start in range(0, len(idxs), BATCH):
-            batch = idxs[start:start+BATCH]
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
 
-            xb = X_cpu[batch].to(device, dtype=torch.float32) / 255.0
-            yb = y_cpu[batch].to(device)
+            opt.zero_grad(set_to_none=True)
 
-            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
-            xb = (xb - mean) / std
-            xb = gpu_augment(xb)
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                loss = loss_fn(local_model(x), y)
 
-            opt.zero_grad()
-            out = model(xb)
-            loss = loss_fn(out, yb)
-            loss.backward()
+            scaler.scale(loss).backward()
 
             # SCAFFOLD correction
-            for i, p in enumerate(params):
-                p.grad += DAMPING * (c_global[i] - c_local[i])
+            with torch.no_grad():
+                for name, p in local_model.named_parameters():
+                    if p.grad is not None:
+                        p.grad += (c_global[name] - c_local[name])
 
-            torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
 
-    # compute Δc
-    new_params = [p.detach().clone() for p in params]
-    delta_c = []
-    E = max(1, len(idxs) // BATCH)
+    # Δw
+    delta_w = {}
+    with torch.no_grad():
+        for name, p in local_model.named_parameters():
+            delta_w[name] = p.detach() - global_params[name]
 
-    for i in range(len(params)):
-        diff = new_params[i] - old_params[i]
-        dc = BETA * (diff / E)
-        delta_c.append(dc)
-        c_local[i] += dc
+    # update c_local
+    T = LOCAL_EPOCHS * len(loader)
+    c_local_new = {}
+    with torch.no_grad():
+        for k in c_local:
+            c_local_new[k] = (
+                c_local[k]
+                - c_global[k]
+                + (1.0 / (T * LR)) * delta_w[k]
+            )
 
-    return new_params, delta_c, c_local
+    return c_local_new, delta_w
 
+# ======================================================
+# AGGREGATION — PESATA + BN BUFFERS (FAIR)
+# ======================================================
+def scaffold_aggregate_weighted(
+    global_model,
+    local_models,
+    deltas,
+    c_global,
+    c_locals_new,
+    client_sizes
+):
+    total = float(sum(client_sizes))
+
+    with torch.no_grad():
+
+        # 1) Update trainable parameters
+        for name, p in global_model.named_parameters():
+            if p.dtype.is_floating_point:
+                p.add_(sum(
+                    (client_sizes[i] / total) * deltas[i][name]
+                    for i in range(len(deltas))
+                ))
+
+        # 2) Update global control variate
+        for k in c_global:
+            c_global[k] = sum(
+                (client_sizes[i] / total) * c_locals_new[i][k]
+                for i in range(len(c_locals_new))
+            )
+
+        # 3) Aggregate BN buffers
+        global_buffers = dict(global_model.named_buffers())
+        local_buffers_list = [dict(m.named_buffers()) for m in local_models]
+
+        for bname, gb in global_buffers.items():
+            if gb.dtype.is_floating_point:
+                gb.copy_(sum(
+                    (client_sizes[i] / total) *
+                    local_buffers_list[i][bname].to(gb.device)
+                    for i in range(len(local_models))
+                ))
+            else:
+                gb.copy_(torch.max(torch.stack([
+                    local_buffers_list[i][bname].to(gb.device)
+                    for i in range(len(local_models))
+                ])))
 
 # ======================================================
 # EVALUATION
 # ======================================================
-
-def evaluate(model, X_cpu, y_cpu, device):
+def evaluate(model, loader):
     model.eval()
     correct = 0
-    tot = len(y_cpu)
+    total = 0
 
-    mean = torch.tensor([0.5, 0.5, 0.5], device=device).view(1,3,1,1)
-    std = torch.tensor([0.5, 0.5, 0.5], device=device).view(1,3,1,1)
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
+            pred = model(x).argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
 
-    with torch.no_grad():
-        for start in range(0, tot, 256):
-            xb = X_cpu[start:start+256].to(device, dtype=torch.float32) / 255.0
-            yb = y_cpu[start:start+256].to(device)
-
-            xb = F.interpolate(xb, size=IMG_SIZE, mode="bilinear", align_corners=False)
-            xb = (xb - mean) / std
-
-            out = model(xb)
-            pred = out.argmax(1)
-            correct += (pred == yb).sum().item()
-
-    return correct / tot
-
+    return 100 * correct / total
 
 # ======================================================
-# FEDERATED LOOP
+# DIRICHLET SPLIT
 # ======================================================
+def dirichlet_split(labels, num_clients, alpha):
+    labels = np.array(labels)
+    num_classes = len(np.unique(labels))
 
-def federated_run():
-    device = "cuda:0"
+    while True:
+        client_indices = [[] for _ in range(num_clients)]
 
-    log("Carico CIFAR-100 (CPU, 32x32)...")
+        for c in range(num_classes):
+            idx = np.where(labels == c)[0]
+            np.random.shuffle(idx)
 
-    transform = transforms.ToTensor()
-    trainset = datasets.CIFAR100(root="./data", train=True, download=True, transform=transform)
-    testset = datasets.CIFAR100(root="./data", train=False, download=True, transform=transform)
+            props = np.random.dirichlet([alpha] * num_clients)
+            props = (props * len(idx)).astype(int)
 
-    X_train = (trainset.data.transpose(0,3,1,2)).copy()
-    X_test = (testset.data.transpose(0,3,1,2)).copy()
+            while props.sum() < len(idx):
+                props[np.argmax(props)] += 1
 
-    X_train = torch.from_numpy(X_train).to(torch.uint8)
-    X_test = torch.from_numpy(X_test).to(torch.uint8)
+            start = 0
+            for i in range(num_clients):
+                end = start + props[i]
+                client_indices[i].extend(idx[start:end])
+                start = end
 
-    y_train = torch.tensor(trainset.targets, dtype=torch.long)
-    y_test = torch.tensor(testset.targets, dtype=torch.long)
+        if all(len(ci) > 0 for ci in client_indices):
+            return client_indices
 
-    for alpha in DIR_ALPHAS:
-        log(f"\n==== CIFAR-100 | α={alpha} ====\n")
+# ======================================================
+# MAIN
+# ======================================================
+def main():
+    seed_everything(SEED)
 
-        splits = dirichlet_split(y_train, NUM_CLIENTS, alpha)
+    transform = transforms.Compose([
+        transforms.Resize(160),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.4914, 0.4822, 0.4465),
+            std=(0.2470, 0.2435, 0.2616)
+        )
+    ])
 
-        global_model = ResNet18Pre(100).to(device)
-        params = [p for p in global_model.parameters() if p.requires_grad]
+    train_raw = datasets.CIFAR10("./data", train=True, download=True, transform=transform)
+    test_raw  = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
 
-        c_global = [torch.zeros_like(p) for p in params]
-        c_local = [[torch.zeros_like(p) for p in params] for _ in range(NUM_CLIENTS)]
+    testloader = DataLoader(
+        test_raw, batch_size=BATCH, shuffle=False,
+        num_workers=2, pin_memory=True
+    )
 
-        for rnd in range(1, NUM_ROUNDS+1):
-            lr = LR_INIT if rnd <= LR_DECAY_ROUND else LR_DECAY
+    labels_train = train_raw.targets
 
-            global_snapshot = [p.detach().clone() for p in params]
+    for ALPHA in ALPHAS:
+        print("\n============================")
+        print(f"=== Dirichlet alpha = {ALPHA} | SCAFFOLD (CIFAR-10 FAIR) ===")
+        print("============================")
 
-            newP_all = []
-            dC_all = []
+        global_model = ResNet18_C10().to(DEVICE)
+
+        params = get_param_dict(global_model)
+        c_global = {k: torch.zeros_like(v, device=DEVICE) for k, v in params.items()}
+        c_locals = [
+            {k: torch.zeros_like(v, device=DEVICE) for k, v in params.items()}
+            for _ in range(NUM_CLIENTS)
+        ]
+
+        client_indices = dirichlet_split(labels_train, NUM_CLIENTS, ALPHA)
+        client_sizes = [len(idx) for idx in client_indices]
+
+        for rnd in range(1, ROUNDS + 1):
+
+            deltas = []
+            new_c_locals = []
+            local_models = []
 
             for cid in range(NUM_CLIENTS):
-                local_model = ResNet18Pre(100).to(device)
+                subset = Subset(train_raw, client_indices[cid])
+                loader = DataLoader(
+                    subset, batch_size=BATCH, shuffle=True,
+                    num_workers=2, pin_memory=True
+                )
 
-                with torch.no_grad():
-                    j = 0
-                    for p in local_model.parameters():
-                        if p.requires_grad:
-                            p.copy_(global_snapshot[j])
-                            j += 1
+                local_model = ResNet18_C10().to(DEVICE)
+                local_model.load_state_dict(global_model.state_dict(), strict=True)
 
-                newP, dC, cl = run_client(local_model, splits[cid], X_train, y_train,
-                                          c_global, c_local[cid], lr, device)
+                c_new, delta = local_train_scaffold(
+                    local_model, global_model,
+                    c_locals[cid], c_global, loader
+                )
 
-                c_local[cid] = cl
-                newP_all.append(newP)
-                dC_all.append(dC)
+                new_c_locals.append(c_new)
+                deltas.append(delta)
+                local_models.append(local_model)
 
-            # federated averaging
-            avgP = []
-            for i in range(len(params)):
-                avgP.append(torch.stack([cp[i] for cp in newP_all]).mean(0))
+            scaffold_aggregate_weighted(
+                global_model,
+                local_models,
+                deltas,
+                c_global,
+                new_c_locals,
+                client_sizes
+            )
 
-            with torch.no_grad():
-                j = 0
-                for p in global_model.parameters():
-                    if p.requires_grad:
-                        p.copy_(avgP[j])
-                        j += 1
+            c_locals = new_c_locals
 
-            # update global control variate
-            for i in range(len(params)):
-                c_global[i] = torch.stack([dc[i] for dc in dC_all]).mean(0)
-
-            acc = evaluate(global_model, X_test, y_test, device)
-            log(f"[ROUND {rnd}] ACC = {acc*100:.2f}%")
-
-
-
-def main():
-    set_seed(SEED)
-    federated_run()
-
+            acc = evaluate(global_model, testloader)
+            print(f"[ALPHA {ALPHA}][ROUND {rnd}] ACC = {acc:.2f}%")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
